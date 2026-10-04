@@ -39,7 +39,7 @@ def evaluate(text, requested_key=None, reference_text=None, train_lines=None):
         "planned_bars": int(meta_fields(meta).get("bars", 0) or 0),
         "notes": sum(len(i.notes) for i in pm.instruments),
         "valid_token_frac": valid / max(1, len(toks)),
-        "duration_s": round(pm.get_end_time(), 1),
+        "duration_s": round(float(pm.get_end_time()), 1),
     }
     if requested_key:
         out["key_match"] = meta_fields(meta).get("key", "").lower() == requested_key.replace(" ", "_").lower()

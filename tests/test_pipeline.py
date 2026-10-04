@@ -77,6 +77,32 @@ def test_work_split_keeps_movements_together():
 
 
 @needs_midi
+def test_run_eval_saves_logs_and_resumes(piece, tmp_path):
+    from midicomposer.runs import load_results, run_eval
+
+    path, text = piece
+    name = os.path.basename(path)
+    targets = [w[2] for w in windows(text)]
+    state = {}
+
+    def replay(messages):
+        if "Write the score header" in messages[-1]["content"]:
+            state["it"] = iter(targets)
+        return next(state["it"])
+
+    args = dict(files=[name], texts={name: text}, descs={name: fallback_description(path)},
+                out_dir=str(tmp_path), tag="ckpt-a", seeds=(0, 1), render=False)
+    rows = run_eval(replay, **args)
+    assert [r["seed"] for r in rows] == [0, 1]
+    for r in rows:
+        assert os.path.exists(r["paths"]["mid"]) and os.path.exists(r["paths"]["txt"])
+        assert r["metrics"]["valid_token_frac"] == 1.0 and r["brief"]
+    assert run_eval(replay, **args) == []
+    assert len(load_results(str(tmp_path / "results.jsonl"))) == 2
+    assert len(run_eval(replay, **{**args, "tag": "ckpt-b", "seeds": (0,)})) == 1
+
+
+@needs_midi
 def test_compose_with_replayed_model(piece):
     """A fake model that replays the real piece window by window must reassemble it."""
     path, text = piece
