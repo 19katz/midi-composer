@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 def note_set(pm, spb=SPB):
     step = pm.resolution / spb
     return {
-        ("lh" if "left" in inst.name.lower() else "rh", round(pm.time_to_tick(n.start) / step), n.pitch): n.start
+        ("L" if "left" in inst.name.lower() else "R", round(pm.time_to_tick(n.start) / step), n.pitch): n.start
         for inst in pm.instruments
         if not inst.is_drum
         for n in inst.notes

@@ -1,21 +1,25 @@
 """MIDI <-> text codec for score-aligned solo piano MIDI.
 
-Format (one line per tag):
+Format:
 
     <|piece_start|>
-    <|meta|> key=F_minor ts=12/8 bars=262 spb=12
-    <|bar|> n=1 pos=0.00 ts=12/8 tempo=126
-    <|rh|> 0:C5:v6:6 6:Ab4.C5:v5:6
-    <|lh|> 0:F2.C3:v4:36
+    <|meta|> key=F_Minor ts=12/8 bars=262 spb=12
+    <|plan|> Exposition:1-65 Development:66-135 ...      (optional; ignored by decode)
+    bar 1 @0.00 q126 ts=12/8
+    R v6 0:C5:6 v5 6:Ab4.C5:6
+    L v4 0:F2.C3:36
     ...
     <|piece_end|>
 
-Note events are `onset:pitches:velocity_bin:duration`, with onset relative to the bar
-and onset/duration measured in grid steps (`spb` steps per quarter note). Simultaneous
-notes sharing onset, duration, and velocity are joined with `.`. `ts=` on a bar line
-appears only when the time signature changes, and `len=` only when the bar's length in
-steps differs from what its time signature implies (cadenzas, irregular bars). `tempo` is the bar's average quarter-note
-BPM, so bar start times survive decoding but rubato within a bar does not.
+Bar lines: bar number, `@` fractional position in the piece, `q` average quarter-note
+BPM over the bar (bar start times survive decoding; rubato within a bar does not),
+`ts=` only when the time signature changes, and `len=` only when the bar's length in
+grid steps differs from what its time signature implies (cadenzas, irregular bars).
+
+Hand lines (`R`, `L`): note events `onset:pitches:duration`, onset relative to the bar,
+both in grid steps (`spb` steps per quarter note). Simultaneous notes sharing onset,
+duration, and velocity are joined with `.`. A `vN` token sets the velocity bin for the
+events that follow it; every hand line that has notes starts with one.
 """
 
 import bisect
@@ -23,29 +27,56 @@ import re
 from collections import defaultdict
 
 import mido
+import numpy as np
 import pretty_midi
 
 SPB = 12
 VEL_BINS = 8
 TICKS_PER_STEP = 40
+PIANO_RANGE = (21, 108)
 
 _MIDO_KEYS = [
     "C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
     "Cm", "C#m", "Dm", "Ebm", "Em", "Fm", "F#m", "Gm", "G#m", "Am", "Bbm", "Bm",
 ]
 
-HANDS = ("rh", "lh")
-TRACK_NAMES = {"rh": "Piano right", "lh": "Piano left"}
+HANDS = ("R", "L")
+TRACK_NAMES = {"R": "Piano right", "L": "Piano left"}
 
 
 def _hand(inst):
-    return "lh" if "left" in inst.name.lower() else "rh"
+    return "L" if "left" in inst.name.lower() else "R"
+
+
+_KS_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+_KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
 
 
 def _key_name(pm):
+    """Main key from the first key signature. These files never mark minor mode, so choose
+    between the signature's major key and its relative minor: the final bar's bass note
+    decides when it is one of the two tonics, otherwise Krumhansl-Schmuckler correlation."""
     if not pm.key_signature_changes:
         return "unknown"
-    return pretty_midi.key_number_to_key_name(pm.key_signature_changes[0].key_number).replace(" ", "_")
+    marked = pm.key_signature_changes[0].key_number
+    if marked >= 12:
+        return pretty_midi.key_number_to_key_name(marked).replace(" ", "_")
+    major = marked
+    minor = (major + 9) % 12
+    notes = [n for inst in pm.instruments if not inst.is_drum for n in inst.notes]
+    last_downbeat = pm.get_downbeats()[-1] if len(pm.get_downbeats()) else 0
+    final = [n for n in notes if n.start >= last_downbeat] or notes[-8:]
+    bass = min(final, key=lambda n: n.pitch).pitch % 12
+    if bass in (major, minor) and major != minor:
+        is_minor = bass == minor
+    else:
+        hist = np.zeros(12)
+        for n in notes:
+            hist[n.pitch % 12] += n.end - n.start
+        corr = lambda profile, tonic: np.corrcoef(hist, np.roll(profile, tonic))[0, 1]
+        is_minor = corr(_KS_MINOR, minor) > corr(_KS_MAJOR, major)
+    number = minor + 12 if is_minor else major
+    return pretty_midi.key_number_to_key_name(number).replace(" ", "_")
 
 
 def _ts_steps(ts, spb):
@@ -85,23 +116,30 @@ def encode(pm, spb=SPB, vel_bins=VEL_BINS):
         ts = ts_changes[max(bisect.bisect_right(ts_ticks, t0) - 1, 0)][1]
         seconds = pm.tick_to_time(t1) - pm.tick_to_time(t0)
         tempo = round(60 * (t1 - t0) / tpb / seconds) if seconds > 0 else 120
-        ts_field = f" ts={ts}" if ts != prev_ts else ""
+        fields = [f"bar {b + 1}", f"@{b / n_bars:.2f}", f"q{tempo}"]
+        if ts != prev_ts:
+            fields.append(f"ts={ts}")
         prev_ts = ts
         length = bar_steps[b + 1] - bar_steps[b]
-        len_field = f" len={length}" if length != _ts_steps(ts, spb) and b < n_bars - 1 else ""
-        lines.append(f"<|bar|> n={b + 1} pos={b / n_bars:.2f}{ts_field}{len_field} tempo={tempo}")
+        if length != _ts_steps(ts, spb) and b < n_bars - 1:
+            fields.append(f"len={length}")
+        lines.append(" ".join(fields))
         for h in HANDS:
-            toks = []
+            toks, cur_vel = [h], None
             for (on, dur, vel), pitches in sorted(events[h][b].items()):
+                if vel != cur_vel:
+                    toks.append(f"v{vel}")
+                    cur_vel = vel
                 names = ".".join(pretty_midi.note_number_to_name(p) for p in sorted(pitches))
-                toks.append(f"{on}:{names}:v{vel}:{dur}")
-            lines.append(f"<|{h}|> " + " ".join(toks))
+                toks.append(f"{on}:{names}:{dur}")
+            lines.append(" ".join(toks))
     lines.append("<|piece_end|>")
     return "\n".join(lines)
 
 
 _FIELD = re.compile(r"(\w+)=(\S+)")
-_NOTE = re.compile(r"^(\d+):([A-G][#b]?-?\d(?:\.[A-G][#b]?-?\d)*):v(\d+):(\d+)$")
+_PITCH = r"[A-G][#b]?-?\d"
+_NOTE = re.compile(rf"^(\d+):({_PITCH}(?:\.{_PITCH})*):(\d+)$")
 
 
 def decode(text, vel_bins=VEL_BINS):
@@ -118,7 +156,7 @@ def decode(text, vel_bins=VEL_BINS):
             spb = int(fields.get("spb", spb))
             ts = fields.get("ts", ts)
             key = fields.get("key")
-        elif tag == "<|bar|>":
+        elif tag == "bar":
             if in_bar:
                 bar_start += bar_len
             in_bar = True
@@ -127,16 +165,24 @@ def decode(text, vel_bins=VEL_BINS):
                 ts_events.append((bar_start, ts))
             elif not ts_events:
                 ts_events.append((bar_start, ts))
-            bar_len = int(fields["len"]) if "len" in fields else _ts_steps(ts, spb)
-            tempo = float(fields.get("tempo", tempo))
+            try:
+                bar_len = int(fields["len"]) if "len" in fields else _ts_steps(ts, spb)
+            except ValueError:
+                bar_len = _ts_steps("4/4", spb)
+            q = re.search(r"\bq(\d+(?:\.\d+)?)\b", rest)
+            if q and float(q[1]) > 0:
+                tempo = float(q[1])
             tempo_events.append((bar_start, tempo))
-        elif tag in ("<|rh|>", "<|lh|>") and in_bar:
-            hand = tag[2:4]
+        elif tag in HANDS and in_bar:
+            vel = vel_bins // 2
             for tok in rest.split():
+                if re.fullmatch(r"v\d+", tok):
+                    vel = min(int(tok[1:]), vel_bins - 1)
+                    continue
                 m = _NOTE.match(tok)
                 if not m:
                     continue
-                on, names, vel, dur = int(m[1]), m[2], int(m[3]), int(m[4])
+                on, names, dur = int(m[1]), m[2], int(m[3])
                 velocity = min(127, vel * (128 // vel_bins) + 128 // vel_bins // 2)
                 for name in names.split("."):
                     try:
@@ -144,7 +190,7 @@ def decode(text, vel_bins=VEL_BINS):
                     except Exception:
                         continue
                     if 0 <= pitch <= 127:
-                        notes[hand].append((bar_start + on, max(1, dur), pitch, velocity))
+                        notes[tag].append((bar_start + on, max(1, dur), pitch, velocity))
 
     tpb = spb * TICKS_PER_STEP
     mid = mido.MidiFile(ticks_per_beat=tpb)
@@ -176,3 +222,35 @@ def _to_track(events):
         now = tick
     track.append(mido.MetaMessage("end_of_track", time=0))
     return track
+
+
+def transpose_key(key, semis):
+    try:
+        number = pretty_midi.key_name_to_key_number(key.replace("_", " "))
+    except Exception:
+        return key
+    mode = number // 12
+    return pretty_midi.key_number_to_key_name((number % 12 + semis) % 12 + 12 * mode).replace(" ", "_")
+
+
+def transpose(text, semis, piano_range=PIANO_RANGE):
+    """Shift every pitch and the key by `semis`. Returns None if any note leaves the piano range."""
+    lo, hi = piano_range
+    lines = []
+    for line in text.splitlines():
+        tag = line.split(" ", 1)[0]
+        if tag in HANDS:
+            toks = []
+            for tok in line.split(" "):
+                m = _NOTE.match(tok)
+                if m:
+                    pitches = [pretty_midi.note_name_to_number(p) + semis for p in m[2].split(".")]
+                    if not all(lo <= p <= hi for p in pitches):
+                        return None
+                    tok = f"{m[1]}:{'.'.join(pretty_midi.note_number_to_name(p) for p in pitches)}:{m[3]}"
+                toks.append(tok)
+            line = " ".join(toks)
+        elif tag == "<|meta|>":
+            line = re.sub(r"key=(\S+)", lambda m: f"key={transpose_key(m[1], semis)}", line)
+        lines.append(line)
+    return "\n".join(lines)
