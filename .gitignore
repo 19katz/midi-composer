@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Generated data and model artifacts
+data/
+checkpoints/
+*.wav
