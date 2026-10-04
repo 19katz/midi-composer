@@ -9,8 +9,14 @@ this repo.
 
 ## Run in Google Colab
 
-[Open `notebooks/pipeline.ipynb` in Colab](https://colab.research.google.com/github/19katz/midi-composer/blob/main/notebooks/pipeline.ipynb),
-pick a GPU runtime, and follow the first cell's instructions:
+Upload `notebooks/midi_composer_colab.ipynb` to Colab (File > Upload notebook), or
+[open it from GitHub](https://colab.research.google.com/github/19katz/midi-composer/blob/main/notebooks/midi_composer_colab.ipynb).
+It is self-contained: the `midicomposer` package is inlined as `%%writefile` cells.
+`notebooks/pipeline.ipynb` is the same pipeline but clones this repo instead, which is
+handier while developing. Regenerate the standalone copy after changing `src/` or
+`pipeline.ipynb` with `python scripts/build_standalone.py` (a test checks it is current).
+
+Pick a GPU runtime and follow the first cell's instructions:
 
 - MIDI files go in Google Drive at `MyDrive/MIDI/`, or upload a zip when prompted.
 - Add a Colab Secret `GEMINI_API_KEY` for real descriptions.

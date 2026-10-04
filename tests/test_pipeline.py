@@ -41,6 +41,15 @@ def test_transpose_inverts(piece):
     assert transpose(text, 60) is None
 
 
+def test_standalone_notebook_is_current():
+    import subprocess
+    import sys
+
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "build_standalone.py")
+    r = subprocess.run([sys.executable, script, "--check"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
 def test_transpose_key():
     assert transpose_key("F_minor", 2) == "G_minor"
     assert transpose_key("B_Major", 1) == "C_Major"
