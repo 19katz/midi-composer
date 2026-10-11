@@ -22,6 +22,7 @@ INTRO = """**Standalone version.** Upload this file to Colab (File > Upload note
 """
 
 SETUP = f"""import glob, json, os, sys
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 IN_COLAB = 'google.colab' in sys.modules
 USE_DRIVE = False
