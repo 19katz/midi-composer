@@ -122,8 +122,8 @@ Settings in the notebook's training cells:
 | Base model | `unsloth/Qwen2.5-3B-Instruct` (~3.1B parameters), via Unsloth |
 | Quantization | Base weights loaded in 4-bit (QLoRA); adapters train in 16-bit |
 | Rank, alpha | `r = 32`, `lora_alpha = 32` (scale 1), dropout 0 |
-| Target layers | Attention and MLP (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`). New token embedding rows are trained when Unsloth accepts PEFT `trainable_token_indices`; full `embed_tokens` / `lm_head` LoRA OOMs a T4 |
-| Trainable parameters | ~60M LoRA weights, plus 897 embedding rows if token-index training is on |
+| Target layers | Attention and MLP only (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`). New token embeddings are initialized by interpolation and then frozen; training the full `embed_tokens` / `lm_head` tables OOMs a T4 |
+| Trainable parameters | ~60M LoRA weights |
 | Loss | On the assistant response only (the score), via Unsloth's `train_on_responses_only`; the brief and context bars are masked |
 | Optimizer, schedule | 8-bit AdamW, learning rate 2e-4, cosine decay with 3% warmup |
 | Batch | 1 window per step, gradient accumulation 8 (effective batch 8) |
