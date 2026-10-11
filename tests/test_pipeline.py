@@ -1,5 +1,6 @@
 import glob
 import io
+import json
 import os
 import random
 
@@ -125,6 +126,18 @@ def test_work_split_keeps_movements_together():
     assert work_id("mz_570_3.mid") == "mz_570"
     train, test = split_by_work(files, test_frac=0.34)
     assert not {work_id(f) for f in train} & {work_id(f) for f in test}
+
+
+def test_archive_stale_results(tmp_path):
+    from midicomposer.runs import archive_stale_results, load_results
+
+    path = tmp_path / "results.jsonl"
+    path.write_text(json.dumps({"tag": "old", "metrics": {"bars": 1}}) + "\n")
+    dest = archive_stale_results(str(path))
+    assert dest and dest.endswith(".jsonl") and not path.exists()
+    assert load_results(dest)[0]["tag"] == "old"
+    path.write_text(json.dumps({"tag": "new", "metrics": {"notes_per_bar": 3}}) + "\n")
+    assert archive_stale_results(str(path)) is None
 
 
 @needs_midi

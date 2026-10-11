@@ -43,6 +43,19 @@ def load_results(path):
         return [json.loads(line) for line in fh if line.strip()]
 
 
+def archive_stale_results(results_path, required_metric="notes_per_bar"):
+    """Rename results.jsonl if any row predates the current metrics schema.
+
+    Returns the archive path, or None if the file was current or missing.
+    """
+    rows = load_results(results_path)
+    if not rows or all(required_metric in (r.get("metrics") or {}) for r in rows):
+        return None
+    dest = f"{os.path.splitext(results_path)[0]}_old_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    os.rename(results_path, dest)
+    return dest
+
+
 def run_eval(generate_fn, files, texts, descs, out_dir, tag, seeds=(0,), variant="styled_detailed",
              max_chunks=40, train_lines=None, set_seed=None, settings=None, render=True, on_piece=None):
     """Compose from each file's brief for each seed, save outputs, and append results.
@@ -52,6 +65,9 @@ def run_eval(generate_fn, files, texts, descs, out_dir, tag, seeds=(0,), variant
     """
     os.makedirs(out_dir, exist_ok=True)
     results_path = os.path.join(out_dir, "results.jsonl")
+    archived = archive_stale_results(results_path)
+    if archived:
+        print(f"Archived old-format results to {archived}")
     done = {(r["file"], r["seed"], r["tag"]) for r in load_results(results_path)}
     rows = []
     for f in files:
