@@ -8,27 +8,26 @@ as context and ask for the next bars. The same `make_prompt` is used at generati
 import random
 import re
 
-from .codec import transpose
+from .codec import HANDS, transpose
 from .describe import VARIANTS
+from .vocab import approx_tokens
 
 SYSTEM = "You are a composer of classical solo piano music. You write scores in a compact text notation."
 
-
-def approx_tokens(text):
-    return len(text) / 1.25
+_BAR_BODY = HANDS + ("<|ped|>",)
 
 
 def split_piece(text):
-    """Return (meta_line, bars) where each bar is its 'bar' line plus its hand lines."""
+    """Return (meta_line, bars) where each bar is its bar line plus hand/pedal lines."""
     meta, bars, cur = None, [], []
     for line in text.splitlines():
         if line.startswith("<|meta|>"):
             meta = line
-        elif line.startswith("bar "):
+        elif line.startswith("<|bar|>"):
             if cur:
                 bars.append("\n".join(cur))
             cur = [line]
-        elif line[:2] in ("R ", "L ") or line in ("R", "L"):
+        elif line.split(" ", 1)[0] in _BAR_BODY:
             if cur:
                 cur.append(line)
     if cur:
@@ -70,7 +69,7 @@ def make_prompt(description, key=None, meter=None, header=None, context_bars=Non
 
 
 def windows(text, sections=None, measure=approx_tokens, target_budget=3000, context_budget=1200,
-            max_target_bars=32, max_context_bars=8):
+            max_target_bars=64, max_context_bars=16):
     """Yield (header, context_bars, target_text, next_bar_number) tuples covering the whole piece."""
     meta, bars = split_piece(text)
     plan = plan_line(sections)

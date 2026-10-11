@@ -12,19 +12,21 @@ import warnings
 import numpy as np
 import pretty_midi
 
-from midicomposer.codec import SPB, encode, decode
+from midicomposer.codec import SPB, _hand, encode, decode
 
 warnings.filterwarnings("ignore")
 
 
 def note_set(pm, spb=SPB):
     step = pm.resolution / spb
-    return {
-        ("L" if "left" in inst.name.lower() else "R", round(pm.time_to_tick(n.start) / step), n.pitch): n.start
-        for inst in pm.instruments
-        if not inst.is_drum
-        for n in inst.notes
-    }
+    out = {}
+    for inst in pm.instruments:
+        if inst.is_drum or _hand(inst) is None:
+            continue
+        h = "L" if _hand(inst) == "<|lh|>" else "R"
+        for n in inst.notes:
+            out[(h, round(pm.time_to_tick(n.start) / step), n.pitch)] = n.start
+    return out
 
 
 def main():

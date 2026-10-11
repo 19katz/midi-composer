@@ -12,7 +12,7 @@ def _complete_bars(text):
 
 
 def compose(generate_fn, description, key=None, meter=None, max_chunks=40, context_budget=1200,
-            max_context_bars=8, measure=approx_tokens, on_chunk=None):
+            max_context_bars=16, measure=approx_tokens, on_chunk=None):
     """`generate_fn(messages) -> str` produces one assistant reply. Returns the full score text."""
     first = generate_fn(make_prompt(description, key, meter))
     header = [l for l in first.splitlines() if l.startswith(("<|meta|>", "<|plan|>"))]

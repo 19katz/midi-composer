@@ -32,6 +32,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 ## Layout
 
+- `src/midicomposer/vocab.py`: dedicated music tokens added to the base LLM vocabulary
 - `src/midicomposer/codec.py`: MIDI <-> text format (see the module docstring)
 - `src/midicomposer/features.py`, `describe.py`: per-piece analysis and Gemini descriptions
 - `src/midicomposer/dataset.py`: windowing, transposition, prompts, split by work
@@ -45,81 +46,59 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 ## How the data is tokenized
 
-Tokenization happens in two stages: MIDI is converted to a text notation, and the base
-model's own tokenizer then splits that text into tokens.
+Two stages: MIDI becomes a text score, then that text is tokenized with Qwen's vocabulary
+**plus about 900 music tokens** from `vocab.py`.
 
 ### Stage 1: MIDI to text (`codec.py`)
 
-Each piece becomes a header followed by one bar line and two hand lines per bar:
-
 ```
 <|piece_start|>
-<|meta|> key=F_minor ts=12/8 bars=263 spb=12
-<|plan|> Exposition:1-65 Development:66-135 ...
-bar 37 @0.14 q126
-R v6 0:C5:6 v5 6:Ab4.C5:6
-L v4 0:F2.C3:36
-...
+<|meta|> key=A_minor ts=3/8 bars=126 spb=12
+<|bar|> 2 <|pos_1|> <|q_69|>
+<|rh|> <|v_2|> <|t_0|> <|pit_E5|> <|d_3|> <|t_3|> <|pit_Ds5|> <|d_3|> <|t_6|> <|pit_E5|> <|d_3|>
+<|lh|>
+<|ped|> <|t_0|> <|ped_on|> <|t_12|> <|ped_off|>
 <|piece_end|>
 ```
 
-- **Header.** `<|meta|>` gives the key, the opening time signature, the total number of
-  bars (so the model commits to a length up front), and the grid resolution. `<|plan|>`
-  is the section map with bar ranges, taken from the description LLM; it is optional.
-- **Bar lines.** The bar number, `@` its fractional position in the piece, and `q` the
-  bar's average tempo in quarter notes per minute. `ts=` appears only when the time
-  signature changes, and `len=` only when a bar's real length differs from what its time
-  signature implies (cadenzas and other irregular bars).
-- **Hand lines.** `R` and `L` come from the files' "Piano right" / "Piano left" tracks.
-  Each note event is `onset:pitches:duration`, where the onset is measured from the start
-  of the bar. Onset and duration are in grid steps of 1/12 of a quarter note, which covers
-  sixteenths, triplets, and 32nd-note triplets. Notes with the same onset, duration, and
-  velocity are grouped with `.` (`Ab4.C5`). `vN` sets the velocity level (0-7, from MIDI
-  velocity // 16) for the events that follow it.
-- **Why encode in ticks.** These files are score-aligned: 99.7% of onsets in the median
-  file sit exactly on a 24-steps-per-beat grid in MIDI ticks, and the performer's timing is
-  stored separately in a dense tempo map (a median of 662 tempo changes per piece). Encoding
-  in ticks therefore recovers the written rhythm instead of approximating it from seconds.
-- **What is lost.** Rubato within a bar (tempo is per bar; median onset shift ~30 ms),
-  the sustain pedal (not yet encoded), and some durations of notes re-struck while the
-  same pitch is still held, which MIDI note-off pairing cannot represent.
+- **Header.** Key, opening meter, total bars, grid resolution (`spb=12` steps per quarter
+  note). Optional `<|plan|>` holds section names and bar ranges from the description LLM.
+- **Bar line.** The bar number stays ordinary digits (the base model already counts).
+  `<|pos_N|>` is N% through the piece; `<|q_N|>` is that bar's average tempo.
+  `ts=` / `len=` appear only when meter changes or a bar is irregular (cadenzas).
+- **Hands.** `<|rh|>` / `<|lh|>` from the files' right/left tracks. Each event is
+  `<|t_onset|>` one or more `<|pit_...|>` then `<|d_duration|>`. Chord tones share
+  onset and duration. `<|v_0|>`–`<|v_7|>` set loudness until the next velocity token.
+  Sharps are spelled `s` (`C#4` → `<|pit_Cs4|>`) so each of the 88 piano keys is one token.
+- **Pedal.** Optional `<|ped|>` line: sustain CC64, binarized to on/off, on the same grid.
+- **What is lost.** Rubato within a bar (~30 ms median onset shift), continuous pedal
+  values (only down/up), and some durations of notes re-struck while the same pitch is
+  still held.
 
-Before encoding, the main key is inferred, because these files never mark minor mode (see
-below). `scripts/roundtrip.py` checks the codec over a whole MIDI directory.
+### Stage 2: music tokens on top of Qwen
 
-### Stage 2: text to model tokens
+`music_tokens()` is a fixed list of about 900 strings. Unsloth's `add_new_tokens(...,
+method="interpolation")` adds them before LoRA and initializes each embedding as a blend
+of the mean vocabulary vector and the mean of the subword pieces it replaces (`<|pit_C5|>`
+starts near `:C` + `5`). The English brief still uses Qwen's existing tokens.
 
-The text goes through the base model's tokenizer (Qwen2.5) unchanged. No tokens are added
-to the vocabulary. The tokenizer splits the notation finely, with every digit becoming its
-own token:
+| Family | Count | Example |
+|---|---|---|
+| Structure | 10 | `<|bar|>`, `<|rh|>`, `<|piece_end|>` |
+| Velocity | 8 | `<|v_0|>` … `<|v_7|>` |
+| Onset | 193 | `<|t_0|>` … `<|t_192|>` |
+| Duration | 256 | `<|d_1|>` … `<|d_256|>` |
+| Tempo | 241 | `<|q_20|>` … `<|q_260|>` |
+| Position | 101 | `<|pos_0|>` … `<|pos_100|>` |
+| Pitch | 88 | `<|pit_A0|>` … `<|pit_C8|>` |
 
-```
-"R v6 0:C5:4"  ->  ['R', 'Ġv', '6', 'Ġ', '0', ':C', '5', ':', '4']
-```
+The `<|...|>` spelling cannot appear inside a brief, so a token like `<|d_6|>` will not
+match the word "add6". Bar numbers, key names, and meters stay as ordinary text.
 
-This costs about 8.5 tokens per note, 130 per bar, and roughly 14k per median piece, with
-the longest piece at about 130k. Whole pieces don't fit in a training sequence, so
-`dataset.py` cuts them into windows:
-
-- The first window's target is the header plus the opening bars. Each later window's
-  prompt contains the brief, the header, and up to 8 previous bars (capped at ~1.2k
-  tokens), and its target is up to the next 32 bars (capped at ~3k tokens).
-- Every prompt starts with the composition brief, optionally with the key and meter
-  (each is dropped 30% of the time so the model also works without them).
-- Augmentation: each piece appears in its original key plus 2 random transpositions
-  between -3 and +3 semitones. Shifts that push a note off the 88-key range are skipped,
-  and the key in the header is updated to match.
-- The longest training example is ~4.7k tokens, so `MAX_LEN` is 5120.
-
-At generation time, `compose.py` uses the same prompts: it asks for the header and opening
-bars, then for continuations, until the model writes `<|piece_end|>` or reaches the bar
-count it planned.
-
-Adding about 500 dedicated music tokens to the vocabulary (one each per pitch, onset,
-duration, velocity, position, and tempo bin) would cut sequences to about 42% of their
-current length, so the same window would hold ~75 bars instead of 32. That is the main
-planned improvement. Each new token's embedding would start as the average of the
-subword embeddings it replaces, and those rows would need training alongside LoRA.
+A note is now about 4 tokens (`t`, `pit`, `d`, plus velocity when it changes) instead of
+~8.5. Training windows target ~3k music tokens and up to 64 bars, with up to 16 bars of
+context. `MAX_LEN` is still 5120. At generation time `compose.py` uses the same prompts
+and continues until `<|piece_end|>` or the planned bar count.
 
 ## How LoRA is used
 
@@ -143,8 +122,8 @@ Settings in the notebook's training cells:
 | Base model | `unsloth/Qwen2.5-3B-Instruct` (~3.1B parameters), via Unsloth |
 | Quantization | Base weights loaded in 4-bit (QLoRA); adapters train in 16-bit |
 | Rank, alpha | `r = 32`, `lora_alpha = 32` (scale 1), dropout 0 |
-| Target layers | All linear layers in all 36 layers: `q_proj`, `k_proj`, `v_proj`, `o_proj` (attention) and `gate_proj`, `up_proj`, `down_proj` (MLP) |
-| Trainable parameters | ~60M, about 2% of the model; the saved adapter is ~120 MB |
+| Target layers | Attention and MLP (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) plus `embed_tokens` and `lm_head` so the new music tokens can be learned |
+| Trainable parameters | ~70M LoRA weights; the saved adapter also stores the resized tokenizer |
 | Loss | On the assistant response only (the score), via Unsloth's `train_on_responses_only`; the brief and context bars are masked |
 | Optimizer, schedule | 8-bit AdamW, learning rate 2e-4, cosine decay with 3% warmup |
 | Batch | 1 window per step, gradient accumulation 8 (effective batch 8) |
@@ -161,10 +140,11 @@ which doesn't fit on Colab GPUs. With only 332 pieces, freezing the base model a
 limits overfitting and preserves its general language ability, which the briefs rely on.
 Adapters are small, so several (for example, one per composer) can share one base model.
 
-If the model underfits the notation, raise `r` to 64, or also train the embedding and
-output layers. To scale up, change `BASE_MODEL` to Qwen2.5-7B on an A100. Moving to a
-different model family also changes the token counts above and the chat-template markers
-that `train_on_responses_only` looks for.
+If the model underfits the notation, raise `r` to 64. To scale up, change `BASE_MODEL`
+to Qwen2.5-7B on an A100. A different model family also changes the chat-template markers
+that `train_on_responses_only` looks for; `music_tokens()` stays the same.
+When loading a saved adapter, call `add_new_tokens` with `music_tokens()` on the base
+model **before** loading the adapter, using the same token list and order.
 
 ## Notes on the data
 
@@ -174,5 +154,5 @@ that `train_on_responses_only` looks for.
   encode -> decode, and 96% of files re-encode to identical text. The other 13 differ only
   in durations of notes re-struck while the same pitch is still held. Tempo is stored per
   bar, so rubato within a bar is dropped (median onset shift about 30 ms).
-- Text costs about 1.25 characters per Qwen token: a median piece is ~14k tokens, so
-  training uses windows of up to 32 bars (at most ~4.7k tokens each).
+- Encoded scores are cached under `text_tok1/` so older colon-separated encodings are not
+  reused after the vocabulary change.

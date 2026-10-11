@@ -11,6 +11,7 @@ from midicomposer.compose import compose
 from midicomposer.dataset import build_examples, split_by_work, split_piece, windows, work_id
 from midicomposer.describe import fallback_description
 from midicomposer.evaluate import evaluate
+from midicomposer.vocab import approx_tokens, music_tokens, parse_pit, pit
 
 MIDI_DIR = os.path.expanduser(os.environ.get("MIDI_DIR", "~/MIDI"))
 FILES = sorted(glob.glob(os.path.join(MIDI_DIR, "*.mid")))
@@ -23,13 +24,46 @@ def piece():
     return path, encode(pretty_midi.PrettyMIDI(path))
 
 
+def _note_keys(pm):
+    from midicomposer.codec import SPB
+    step = pm.resolution / SPB
+    return {
+        ("L" if "left" in inst.name.lower() else "R", round(pm.time_to_tick(n.start) / step), n.pitch)
+        for inst in pm.instruments
+        if not inst.is_drum and inst.name != "__dummy_sustain__"
+        for n in inst.notes
+    }
+
+
 @needs_midi
 def test_roundtrip_stable(piece):
-    _, text = piece
+    path, text = piece
+    buf = io.BytesIO()
+    decode(text).save(file=buf)
+    buf.seek(0)
+    pm2 = pretty_midi.PrettyMIDI(buf)
+    assert _note_keys(pretty_midi.PrettyMIDI(path)) == _note_keys(pm2)
+    text2 = encode(pm2)
+    assert text.count("<|ped|>") == text2.count("<|ped|>")
+    assert text2.splitlines()[0] == "<|piece_start|>" and "<|rh|>" in text2
+
+
+def test_synthetic_roundtrip_is_byte_identical():
+    mid = pretty_midi.PrettyMIDI(initial_tempo=120)
+    inst = pretty_midi.Instrument(0, name="Piano right")
+    inst.notes.append(pretty_midi.Note(velocity=80, pitch=72, start=0.0, end=0.5))
+    mid.instruments.append(inst)
+    inst = pretty_midi.Instrument(0, name="Piano left")
+    inst.notes.append(pretty_midi.Note(velocity=64, pitch=48, start=0.0, end=1.0))
+    inst.control_changes.append(pretty_midi.ControlChange(number=64, time=0.0, value=127))
+    inst.control_changes.append(pretty_midi.ControlChange(number=64, time=0.9, value=0))
+    mid.instruments.append(inst)
+    text = encode(mid)
     buf = io.BytesIO()
     decode(text).save(file=buf)
     buf.seek(0)
     assert encode(pretty_midi.PrettyMIDI(buf)) == text
+    assert "<|ped_on|>" in text and "<|pit_C5|>" in text
 
 
 @needs_midi
@@ -48,6 +82,14 @@ def test_standalone_notebook_is_current():
     script = os.path.join(os.path.dirname(__file__), "..", "scripts", "build_standalone.py")
     r = subprocess.run([sys.executable, script, "--check"], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+def test_music_vocab_is_unique_and_covers_piano():
+    toks = music_tokens()
+    assert len(toks) == len(set(toks))
+    assert pit(60) in toks and pit(21) in toks and pit(108) in toks
+    assert parse_pit(pit(61)) == 61
+    assert approx_tokens("<|rh|> <|v_2|> <|t_0|> <|pit_C5|> <|d_6|>") == 5
 
 
 def test_transpose_key():
