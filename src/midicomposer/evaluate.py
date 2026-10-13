@@ -6,9 +6,9 @@ import re
 import numpy as np
 import pretty_midi
 
-from .codec import HANDS, _key_name, decode
+from .codec import HANDS, _key_name, _ts_steps, decode
 from .dataset import meta_fields, split_piece
-from .vocab import parse_pit
+from .vocab import parse_pit, parse_tagged_int
 
 _MUSIC = re.compile(r"<\|(?:v|t|d|pit|ped_on|ped_off)_")
 
@@ -34,6 +34,98 @@ def hand_lines(text):
     return [l for l in text.splitlines() if l.split(" ", 1)[0] in HANDS and len(l.split()) > 1]
 
 
+_MAJOR = {0, 2, 4, 5, 7, 9, 11}
+_MINOR = {0, 2, 3, 5, 7, 8, 10}  # natural minor
+
+
+def _scale(key):
+    number = pretty_midi.key_name_to_key_number(key.replace("_", " "))
+    return (number % 12, _MINOR if number >= 12 else _MAJOR)
+
+
+def _bar_events(bar, bar_len):
+    """(onset, duration, pitch, hand) for notes on the rh/lh lines."""
+    events = []
+    for line in bar.splitlines()[1:]:
+        tag = line.split(" ", 1)[0]
+        if tag not in HANDS:
+            continue
+        onset, pitches = None, []
+        for tok in line.split()[1:]:
+            if tok.startswith("<|t_"):
+                onset, pitches = parse_tagged_int(tok, "t"), []
+            elif tok.startswith("<|pit_"):
+                pitches.append(parse_pit(tok))
+            elif tok.startswith("<|d_") and onset is not None:
+                dur = parse_tagged_int(tok, "d") or 1
+                for pitch in pitches:
+                    if pitch is not None:
+                        events.append((onset, dur, pitch, tag))
+                pitches = []
+    return events
+
+
+def surface_metrics(text, key=None):
+    """Key, rhythm, silence, and tempo measures, from the score text alone.
+
+    diatonic_frac: share of note-duration whose pitch class is in the key's scale
+    (major, or natural minor). Duration is clipped to the bar length.
+    rhythm_repeat_frac: share of right-hand bars whose (onset, duration) list
+    equals the previous bar.
+    silence_frac: mean fraction of each bar's grid with no sounding note.
+    tempo_jump_frac: share of bar-to-bar tempo changes larger than 8%.
+    """
+    meta, bars = split_piece(text)
+    fields = meta_fields(meta)
+    key = key or fields.get("key")
+    scale = None
+    if key:
+        try:
+            scale = _scale(key)
+        except Exception:
+            scale = None
+    ts = fields.get("ts", "4/4")
+    dia = total = 0.0
+    silence, tempos = [], []
+    same = pairs = 0
+    prev_rh = None
+    for bar in bars:
+        head = bar.splitlines()[0]
+        bar_fields = dict(re.findall(r"(\w+)=(\S+)", head))
+        if "ts" in bar_fields:
+            ts = bar_fields["ts"]
+        try:
+            bar_len = int(bar_fields["len"]) if "len" in bar_fields else _ts_steps(ts, int(fields.get("spb", 12)))
+        except ValueError:
+            bar_len = _ts_steps("4/4", 12)
+        bar_len = max(1, bar_len)
+        q = next((parse_tagged_int(t, "q") for t in head.split() if t.startswith("<|q_")), None)
+        if q:
+            tempos.append(q)
+        events = _bar_events(bar, bar_len)
+        covered = [False] * bar_len
+        for onset, dur, pitch, _hand in events:
+            weight = max(0, min(onset + dur, bar_len) - max(0, onset))
+            total += weight
+            if scale and (pitch - scale[0]) % 12 in scale[1]:
+                dia += weight
+            for step in range(max(0, onset), min(bar_len, onset + dur)):
+                covered[step] = True
+        silence.append(1 - sum(covered) / bar_len)
+        rh = tuple((onset, dur) for onset, dur, _pitch, hand in events if hand == "<|rh|>")
+        if prev_rh is not None and rh:
+            pairs += 1
+            same += rh == prev_rh
+        prev_rh = rh
+    jumps = [abs(b - a) / a > 0.08 for a, b in zip(tempos, tempos[1:]) if a]
+    return {
+        "diatonic_frac": round(dia / total, 3) if scale and total else None,
+        "rhythm_repeat_frac": round(same / pairs, 3) if pairs else None,
+        "silence_frac": round(sum(silence) / len(silence), 3) if silence else None,
+        "tempo_jump_frac": round(sum(jumps) / len(jumps), 3) if jumps else None,
+    }
+
+
 def _empty_bar_frac(bars):
     if not bars:
         return 1.0
@@ -56,6 +148,7 @@ def evaluate(text, requested_key=None, reference_text=None, train_lines=None):
         "notes": n_notes,
         "notes_per_bar": round(n_notes / max(1, len(bars)), 2),
         "empty_bar_frac": round(_empty_bar_frac(bars), 3),
+        **surface_metrics(text, requested_key or meta_fields(meta).get("key")),
         "valid_token_frac": valid / max(1, len(toks)),
         "duration_s": round(float(pm.get_end_time()), 1),
     }

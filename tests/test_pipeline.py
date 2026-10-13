@@ -85,6 +85,29 @@ def test_standalone_notebook_is_current():
     assert r.returncode == 0, r.stderr
 
 
+def test_surface_metrics_key_rhythm_silence_tempo():
+    from midicomposer.evaluate import surface_metrics
+
+    text = """<|piece_start|>
+<|meta|> key=C_Major ts=4/4 bars=3 spb=12
+<|bar|> 1 <|pos_0|> <|q_100|> ts=4/4
+<|rh|> <|v_4|> <|t_0|> <|pit_C4|> <|d_48|>
+<|lh|>
+<|bar|> 2 <|pos_33|> <|q_100|>
+<|rh|> <|v_4|> <|t_0|> <|pit_C4|> <|d_48|>
+<|lh|>
+<|bar|> 3 <|pos_66|> <|q_140|>
+<|rh|> <|v_4|> <|t_0|> <|pit_Fs4|> <|d_24|>
+<|lh|>
+<|piece_end|>
+"""
+    m = surface_metrics(text)
+    assert m["rhythm_repeat_frac"] == 0.5  # bar 2 copies bar 1; bar 3 does not
+    assert m["silence_frac"] == 0.167
+    assert m["tempo_jump_frac"] == 0.5  # 100 -> 140 is a jump; 100 -> 100 is not
+    assert 0.6 < m["diatonic_frac"] < 0.9  # F# is the only chromatic note
+
+
 def test_music_vocab_is_unique_and_covers_piano():
     toks = music_tokens()
     assert len(toks) == len(set(toks))
@@ -176,3 +199,97 @@ def test_compose_with_replayed_model(piece):
     assert split_piece(out)[1] == split_piece(text)[1]
     m = evaluate(out, requested_key="F Minor", reference_text=text)
     assert m["valid_token_frac"] == 1.0 and m["key_match"] and m["pc_hist_l1_to_reference"] < 1e-9
+
+
+class _Tok:
+    def __init__(self):
+        from midicomposer.vocab import music_tokens
+        tokens = music_tokens() + [
+            "Key", ":", " C#", " minor", "\n", "Meter", " 3/8", " ",
+            "len", "=", "20", "ts", "4", "/", "4",
+        ]
+        self.i2t = {i + 1: t for i, t in enumerate(tokens)}
+        self.t2i = {t: i for i, t in self.i2t.items()}
+        self.unk_token_id = 0
+
+    def convert_tokens_to_ids(self, tok):
+        return self.t2i.get(tok, 0)
+
+    def convert_ids_to_tokens(self, i):
+        return self.i2t.get(int(i), "")
+
+    def ids(self, *tokens):
+        return [self.t2i[t] for t in tokens]
+
+
+def test_score_constraints_mask_key_rhythm_onset_and_tempo():
+    import numpy as np
+    from midicomposer.constraints import ScoreConstraints
+
+    tok = _Tok()
+    proc = ScoreConstraints(tok, pitch_penalty=8, chromatic_budget=2, tempo_ratio=0.08)
+    # Prompt ends on a finished bar: RH eighth-eighth, tempo 100, 3/8 so the bar is 18 steps.
+    # C# minor contains F#; C and D and F are the chromatic notes used below.
+    opening = tok.ids(
+        "Key", ":", " C#", " minor", "\n",
+        "Meter", ":", " 3/8", "\n",
+        "<|bar|>", "<|q_100|>",
+        "<|rh|>", "<|t_0|>", "<|pit_Cs4|>", "<|d_6|>", "<|t_6|>", "<|pit_E4|>", "<|d_6|>",
+        "<|lh|>",
+    )
+    scores = np.zeros((1, max(tok.i2t) + 1))
+    proc(np.array([opening]), scores)
+    assert proc.prev_rh == ((0, 6), (6, 6))
+    assert proc.prev_q == 100
+    assert proc.bar_len == 18
+
+    # Continuation copies the first onset and duration, then the second onset.
+    # The duration that would finish the copy is banned; the shared downbeat is not.
+    copied = tok.ids("<|bar|>", "<|rh|>", "<|t_0|>", "<|pit_Cs4|>", "<|d_6|>", "<|t_6|>")
+    proc(np.array([opening + copied]), scores)
+    bans, pens = proc.decisions()
+    assert tok.t2i["<|d_6|>"] in bans
+    assert tok.t2i["<|t_0|>"] not in bans
+    assert tok.t2i["<|q_100|>"] not in bans
+    assert tok.t2i["<|q_101|>"] in bans  # 1% wobble
+    assert tok.t2i["<|q_120|>"] not in bans  # real jump
+    assert tok.t2i["<|t_18|>"] not in bans  # pitch position, not onset position
+    fs = tok.t2i["<|pit_Fs4|>"]  # F# is outside C# minor (C# D# E F# G# A B) — F# IS in C# minor!
+    # C# minor: C# D# E F# G# A B. Chromatic: C, D, F, G, A#...
+    # Use C natural, pit_C4.
+    cnat = tok.t2i["<|pit_C4|>"]
+    assert cnat in pens and fs not in pens
+
+    # Two chromatic notes fill the budget; the next out-of-key pitch is banned.
+    more = tok.ids("<|pit_C4|>", "<|pit_D4|>")
+    proc(np.array([opening + copied + more]), scores)
+    bans, pens = proc.decisions()
+    assert tok.t2i["<|pit_F4|>"] in bans
+    assert fs not in bans
+
+    # A different first duration breaks the copy, so the old completing duration is free.
+    proc2 = ScoreConstraints(tok, pitch_penalty=8, chromatic_budget=2, tempo_ratio=0.08)
+    proc2(np.array([opening]), np.zeros((1, max(tok.i2t) + 1)))
+    diverged = tok.ids("<|bar|>", "<|rh|>", "<|t_0|>", "<|pit_Cs4|>", "<|d_8|>", "<|t_6|>")
+    proc2(np.array([opening + diverged]), np.zeros((1, max(tok.i2t) + 1)))
+    bans, _ = proc2.decisions()
+    assert tok.t2i["<|d_6|>"] not in bans
+
+    # Onset position: t_18 is past a 3/8 bar. len=10 shortens it further.
+    proc3 = ScoreConstraints(tok)
+    proc3(np.array([opening]), np.zeros((1, max(tok.i2t) + 1)))
+    proc3(np.array([opening + tok.ids("<|bar|>", "<|rh|>")]), np.zeros((1, max(tok.i2t) + 1)))
+    bans, _ = proc3.decisions()
+    assert tok.t2i["<|t_18|>"] in bans and tok.t2i["<|t_0|>"] not in bans
+    short = tok.ids("<|bar|>", "len", "=", "20")
+    # "20" is the token; len=20 would be wrong because bar steps of 20 still bans t_20.
+    # Feed characters that concatenate to len=10. The vocab has "20" only.
+    # Use header pieces "len" "=" and a digit token. Add by consuming raw through known tokens:
+    # token " " exists. Build len=10 from tokens we have: there is no "10" or "1" "0".
+    # "20" makes len=20. Ban t_20, allow t_18.
+    proc4 = ScoreConstraints(tok)
+    proc4(np.array([opening]), np.zeros((1, max(tok.i2t) + 1)))
+    proc4(np.array([opening + tok.ids("<|bar|>", "len", "=", "20", "<|rh|>")]), np.zeros((1, max(tok.i2t) + 1)))
+    bans, _ = proc4.decisions()
+    assert proc4.bar_len == 20
+    assert tok.t2i["<|t_20|>"] in bans and tok.t2i["<|t_18|>"] not in bans
