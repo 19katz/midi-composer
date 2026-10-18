@@ -47,58 +47,63 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ## How the data is tokenized
 
 Two stages: MIDI becomes a text score, then that text is tokenized with Qwen's vocabulary
-**plus about 900 music tokens** from `vocab.py`.
+**plus about 700 music tokens** from `vocab.py`.
 
 ### Stage 1: MIDI to text (`codec.py`)
 
 ```
 <|piece_start|>
-<|meta|> key=A_minor ts=3/8 bars=126 spb=12
-<|bar|> 2 <|pos_1|> <|q_69|>
-<|rh|> <|v_2|> <|t_0|> <|pit_E5|> <|d_3|> <|t_3|> <|pit_Ds5|> <|d_3|> <|t_6|> <|pit_E5|> <|d_3|>
+<|meta|> key=A_minor ts=3/8 bars=126 spb=12 tempo=69
+<|bar|> 2 <|pos_1|> <|tempo_hold|> <|ch_I|> <|rhythm_new|>
+<|mel|> <|v_2|> <|t_0|> <|sd_5|> <|oct_5|> <|d_3|>
+<|rh|>
 <|lh|>
 <|ped|> <|t_0|> <|ped_on|> <|t_12|> <|ped_off|>
 <|piece_end|>
 ```
 
 - **Header.** Key, opening meter, total bars, grid resolution (`spb=12` steps per quarter
-  note). Optional `<|plan|>` holds section names and bar ranges from the description LLM.
-- **Bar line.** The bar number stays ordinary digits (the base model already counts).
-  `<|pos_N|>` is N% through the piece; `<|q_N|>` is that bar's average tempo.
-  `ts=` / `len=` appear only when meter changes or a bar is irregular (cadenzas).
-- **Hands.** `<|rh|>` / `<|lh|>` from the files' right/left tracks. Each event is
-  `<|t_onset|>` one or more `<|pit_...|>` then `<|d_duration|>`. Chord tones share
-  onset and duration. `<|v_0|>`–`<|v_7|>` set loudness until the next velocity token.
-  Sharps are spelled `s` (`C#4` → `<|pit_Cs4|>`) so each of the 88 piano keys is one token.
+  note), and the opening tempo bin. Optional `<|plan|>` holds section spans.
+- **Bar line.** The bar number stays ordinary digits. `<|pos_N|>` is N% through the piece.
+  Tempo is one of ~34 bins, each about 8% faster than the last, written only when the bin
+  changes; other bars are `<|tempo_hold|>`. `<|ch_|>` is the bar's triad. `<|rhythm_same|>`
+  means the attacks fall on the same eighth-note beats as the previous bar. `<|phrase|>`
+  marks every fourth bar.
+- **Notes.** Scale degrees of the header key (`<|sd_1|>`..`<|sd_7|>` plus `<|oct_N|>`).
+  `<|acc_N|>` appears only when the note leaves the scale, and each sounding pitch has one
+  spelling. The highest right-hand note at an attack is `<|mel|>`; other chord tones stay
+  on `<|rh|>`. Decode merges melody back onto the right-hand track.
 - **Pedal.** Optional `<|ped|>` line: sustain CC64, binarized to on/off, on the same grid.
-- **What is lost.** Rubato within a bar (~30 ms median onset shift), continuous pedal
+- **What is lost.** Rubato within a bar, tempo changes smaller than one bin, continuous pedal
   values (only down/up), and some durations of notes re-struck while the same pitch is
-  still held.
+  still held. Onsets past the bar are clamped on decode so the note still sounds.
 
 ### Stage 2: music tokens on top of Qwen
 
-`music_tokens()` is a fixed list of about 900 strings. Unsloth's `add_new_tokens(...,
-method="interpolation")` adds them before LoRA and initializes each embedding as a blend
-of the mean vocabulary vector and the mean of the subword pieces it replaces (`<|pit_C5|>`
-starts near `:C` + `5`). The English brief still uses Qwen's existing tokens.
+`music_tokens()` is a fixed list. Unsloth's `add_new_tokens(..., method="interpolation")`
+adds them before LoRA and initializes each embedding as a blend of nearby vocabulary
+vectors. The English brief still uses Qwen's existing tokens. The new rows of
+`embed_tokens` and `lm_head` are trained on their own (see below); the rest of those
+matrices stay frozen.
 
 | Family | Count | Example |
 |---|---|---|
-| Structure | 10 | `<|bar|>`, `<|rh|>`, `<|piece_end|>` |
+| Structure | 15 | `<|bar|>`, `<|mel|>`, `<|tempo_hold|>`, `<|rhythm_new|>` |
+| Chord | 15 | `<|ch_I|>`, `<|ch_V7|>`, `<|ch_none|>` |
+| Degree, octave, accidental | 7 + 9 + 4 | `<|sd_5|>`, `<|oct_4|>`, `<|acc_-1|>` |
 | Velocity | 8 | `<|v_0|>` … `<|v_7|>` |
 | Onset | 193 | `<|t_0|>` … `<|t_192|>` |
 | Duration | 256 | `<|d_1|>` … `<|d_256|>` |
-| Tempo | 241 | `<|q_20|>` … `<|q_260|>` |
+| Tempo | ~34 | `<|q_20|>`, `<|q_99|>`, … one bin per ~8% |
 | Position | 101 | `<|pos_0|>` … `<|pos_100|>` |
-| Pitch | 88 | `<|pit_A0|>` … `<|pit_C8|>` |
 
-The `<|...|>` spelling cannot appear inside a brief, so a token like `<|d_6|>` will not
-match the word "add6". Bar numbers, key names, and meters stay as ordinary text.
+The `<|...|>` spelling cannot appear inside a brief. Bar numbers, key names, and meters
+stay as ordinary text. A diatonic note is onset, degree, octave, duration. A chromatic
+note adds one accidental token.
 
-A note is now about 4 tokens (`t`, `pit`, `d`, plus velocity when it changes) instead of
-~8.5. Training windows target ~3k music tokens and up to 64 bars, with up to 16 bars of
-context. `MAX_LEN` is still 5120. At generation time `compose.py` uses the same prompts
-and continues until `<|piece_end|>` or the planned bar count.
+Training windows target ~3k music tokens and up to 64 bars, with up to 16 bars of
+context. `MAX_LEN` is 1024 for a smoke test and 4096 for a full run. At generation time
+`compose.py` stops at the original work's bar count.
 
 ## How LoRA is used
 
@@ -122,12 +127,12 @@ Settings in the notebook's training cells:
 | Base model | `unsloth/Qwen2.5-3B-Instruct` (~3.1B parameters), via Unsloth |
 | Quantization | Base weights loaded in 4-bit (QLoRA); adapters train in 16-bit |
 | Rank, alpha | `r = 32`, `lora_alpha = 32` (scale 1), dropout 0 |
-| Target layers | Attention and MLP only (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`). New token embeddings are initialized by interpolation and then frozen; training the full `embed_tokens` / `lm_head` tables OOMs a T4 |
-| Trainable parameters | ~60M LoRA weights |
-| Loss | On the assistant response only (the score), via Unsloth's `train_on_responses_only`; the brief and context bars are masked |
+| Target layers | Attention and MLP only (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`), plus the new-token rows of `embed_tokens` and `lm_head` |
+| Trainable parameters | ~60M LoRA weights, and one row per music token in each of those two matrices. The rows are saved as `new_token_rows.pt` next to the adapter |
+| Loss | On the assistant response only, via Unsloth's `train_on_responses_only`. Chord, rhythm, tempo, phrase, and melody-line tokens are upweighted by 3 |
 | Optimizer, schedule | 8-bit AdamW, learning rate 2e-4, cosine decay with 3% warmup |
 | Batch | 1 window per step, gradient accumulation 8 (effective batch 8) |
-| Length, epochs | `MAX_LEN = 5120`, 1 epoch (30 steps in smoke-test mode) |
+| Length, epochs | `MAX_LEN` 1024 (smoke) or 4096 (full), 1 epoch (30 steps in smoke-test mode). Stop when diatonic rate, rhythm repeat, silence, and tempo jumps stop moving toward the paired originals |
 | Precision | bf16 where supported (A100, L4), otherwise fp16 (T4) |
 
 Each training example is rendered with the Qwen chat template: a system message, the user
@@ -154,5 +159,6 @@ model **before** loading the adapter, using the same token list and order.
   encode -> decode, and 96% of files re-encode to identical text. The other 13 differ only
   in durations of notes re-struck while the same pitch is still held. Tempo is stored per
   bar, so rubato within a bar is dropped (median onset shift about 30 ms).
-- Encoded scores are cached under `text_tok1/` so older colon-separated encodings are not
-  reused after the vocabulary change.
+- Encoded scores are cached under `text_tok2/`. The previous absolute-pitch cache (`text_tok1/`)
+  is unused and can be deleted. Checkpoints and adapters are `checkpoints/<run>_tok2` and
+  `adapters/<run>_tok2`.

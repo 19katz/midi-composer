@@ -14,7 +14,8 @@ from .vocab import approx_tokens
 
 SYSTEM = "You are a composer of classical solo piano music. You write scores in a compact text notation."
 
-_BAR_BODY = HANDS + ("<|ped|>",)
+# Melody is a separate line; it still belongs to the bar, like the two hands.
+_BAR_BODY = ("<|mel|>",) + HANDS + ("<|ped|>",)
 
 
 def split_piece(text):
@@ -99,8 +100,12 @@ def windows(text, sections=None, measure=approx_tokens, target_budget=3000, cont
         start = end
 
 
-def build_examples(text, desc, semitones=(0,), key_dropout=0.3, rng=None, **window_kw):
-    """Prompt/completion examples for one piece across transpositions."""
+def build_examples(text, desc, semitones=(0,), key_dropout=0.0, rng=None, **window_kw):
+    """Prompt/completion examples for one piece across transpositions.
+
+    `key_dropout` defaults to 0. Scale degrees are meaningless without the key
+    in the prompt, which is what a 30% dropout was doing to absolute pitch names.
+    """
     rng = rng or random.Random(0)
     out = []
     for semis in semitones:

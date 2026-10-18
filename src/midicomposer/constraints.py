@@ -1,21 +1,23 @@
-"""Sampling masks for a checkpoint that already writes valid score text.
+"""Soft scores for a model that already writes valid score text.
 
-Applied inside `model.generate`, so later tokens are chosen given a legal pitch,
-onset, rhythm, and tempo. Three masks:
+Applied inside `model.generate`. Real pieces sit in the middle of these axes
+(about 83% diatonic, 19% repeated rhythm, 8% silence), so the defaults penalize
+the extremes instead of banning them:
 
-- pitch: while a pitch token is expected, penalize notes outside the key. After
-  `chromatic_budget` chromatic notes in the bar, ban further ones.
-- onset: while an onset token is expected, ban steps at or past the bar length.
-- rhythm / tempo: ban the duration that would make the right hand an exact copy
-  of the previous bar, and ban tempo tokens within `tempo_ratio` of the previous
-  bar (the previous tempo itself stays allowed).
+- accidentals and non-chord degrees get `pitch_penalty` (small). A hard ban only
+  starts after `chromatic_budget` accidentals in the bar.
+- an onset whose eighth-note beat matches the previous bar, at the same place in
+  the bar, gets `rhythm_penalty`. The duration that would finish an exact copy does too.
+- ending a bar that is still mostly empty gets `silence_penalty`. An empty bar is left alone.
+- an onset at or past the bar length is still banned. So is a tempo token within
+  `tempo_ratio` of the previous bar, other than the previous tempo itself.
 """
 
 import re
 
 from .codec import _ts_steps
 from .evaluate import _scale
-from .vocab import music_tokens, parse_pit, parse_tagged_int
+from .vocab import chord_pcs, music_tokens, parse_pit, parse_tagged_int, scale_pcs
 
 try:
     from transformers import LogitsProcessor
@@ -25,14 +27,18 @@ except ImportError:  # CPU tests, and any environment without the training stack
 
 
 _MUSIC = re.compile(r"<\|[^|]+\|>")
-_HANDS = ("<|rh|>", "<|lh|>")
+_HANDS = ("<|mel|>", "<|rh|>", "<|lh|>")
 
 
 class ScoreConstraints(LogitsProcessor):
-    def __init__(self, tokenizer, pitch_penalty=8.0, chromatic_budget=2, tempo_ratio=0.08):
+    def __init__(self, tokenizer, pitch_penalty=2.0, chromatic_budget=16, rhythm_penalty=4.0,
+                 silence_penalty=2.0, silence_limit=0.15, tempo_ratio=0.08):
         self.tokenizer = tokenizer
         self.pitch_penalty = float(pitch_penalty)
         self.chromatic_budget = int(chromatic_budget)
+        self.rhythm_penalty = float(rhythm_penalty)
+        self.silence_penalty = float(silence_penalty)
+        self.silence_limit = float(silence_limit)
         self.tempo_ratio = float(tempo_ratio)
         unk = getattr(tokenizer, "unk_token_id", None)
         self.ids = {}
@@ -48,6 +54,10 @@ class ScoreConstraints(LogitsProcessor):
             pitch = parse_pit(tok)
             if pitch is not None:
                 self.pit_ids[pitch] = i
+        self.acc_ids = [i for t, i in self.ids.items() if t.startswith("<|acc_")]
+        self.sd_ids = {parse_tagged_int(t, "sd"): i for t, i in self.ids.items() if t.startswith("<|sd_")}
+        self.bar_id = self.ids.get("<|bar|>")
+        self.end_id = self.ids.get("<|piece_end|>")
         self.reset()
 
     def reset(self):
@@ -65,10 +75,13 @@ class ScoreConstraints(LogitsProcessor):
         self.in_bar = False
         self.prev_q = None
         self.cur_q = None
-        self.prev_rh = None
-        self.cur_rh = []
+        self.prev_events = {}
+        self.cur_events = {h: [] for h in _HANDS}
         self.pending_onset = None
         self.chromatic_count = 0
+        self.chord = None
+        self.covered = set()
+        self.note_count = 0
 
     def __call__(self, input_ids, scores):
         row = input_ids[0]
@@ -103,7 +116,10 @@ class ScoreConstraints(LogitsProcessor):
         elif tok == "<|meta|>":
             self.phase = "meta"
             self.header_buf = ""
-        elif tok in ("<|rh|>", "<|lh|>", "<|ped|>"):
+        elif tok.startswith("<|ch_"):
+            name = tok[5:-2]
+            self.chord = chord_pcs(self.key, name) if self.key else None
+        elif tok in ("<|mel|>", "<|rh|>", "<|lh|>", "<|ped|>"):
             self.hand = tok
             self.phase = "onset"
             self.pending_onset = None
@@ -113,6 +129,9 @@ class ScoreConstraints(LogitsProcessor):
             self.pending_onset = parse_tagged_int(tok, "t")
             if self.hand in _HANDS:
                 self.phase = "pitch"
+        elif tok.startswith("<|acc_"):
+            self.chromatic_count += 1
+            self.phase = "pitch"
         elif tok.startswith("<|pit_"):
             pitch = parse_pit(tok)
             if pitch is not None and self.scale:
@@ -122,23 +141,33 @@ class ScoreConstraints(LogitsProcessor):
             self.phase = "pitch"
         elif tok.startswith("<|d_"):
             dur = parse_tagged_int(tok, "d") or 1
-            if self.hand == "<|rh|>" and self.pending_onset is not None:
-                self.cur_rh.append((self.pending_onset, dur))
+            if self.hand in _HANDS and self.pending_onset is not None:
+                self.cur_events.setdefault(self.hand, []).append((self.pending_onset, dur))
+                if self.bar_len:
+                    self.covered.update(range(max(0, self.pending_onset), min(self.bar_len, self.pending_onset + dur)))
+                self.note_count += 1
             self.pending_onset = None
             self.phase = "onset"
         elif tok.startswith("<|q_"):
             self.cur_q = parse_tagged_int(tok, "q")
 
+    def _commit_bar(self):
+        if any(self.cur_events.get(h) for h in _HANDS):
+            self.prev_events = {h: tuple(self.cur_events.get(h, ())) for h in _HANDS}
+        if self.cur_q:
+            self.prev_q = self.cur_q
+
     def _on_bar(self):
         if self.in_bar:
-            self.prev_rh = tuple(self.cur_rh)
-            if self.cur_q:
-                self.prev_q = self.cur_q
-        self.cur_rh = []
+            self._commit_bar()
+        self.cur_events = {h: [] for h in _HANDS}
         self.cur_q = None
         self.hand = None
         self.pending_onset = None
         self.chromatic_count = 0
+        self.chord = None
+        self.covered = set()
+        self.note_count = 0
         self.header_buf = ""
         self.len_override = False
         self.bar_len = self.default_bar_len
@@ -148,15 +177,16 @@ class ScoreConstraints(LogitsProcessor):
     def _finish_prompt(self):
         """Context bars in the prompt are complete. The next token starts the continuation."""
         if self.in_bar:
-            self.prev_rh = tuple(self.cur_rh)
-            if self.cur_q:
-                self.prev_q = self.cur_q
+            self._commit_bar()
         self.in_bar = False
-        self.cur_rh = []
+        self.cur_events = {h: [] for h in _HANDS}
         self.cur_q = None
         self.hand = None
         self.pending_onset = None
         self.chromatic_count = 0
+        self.chord = None
+        self.covered = set()
+        self.note_count = 0
         self.phase = "header"
         self.header_buf = ""
         self.len_override = False
@@ -202,21 +232,24 @@ class ScoreConstraints(LogitsProcessor):
             self._set_ts(f"{tss[-1][0]}/{tss[-1][1]}")
 
     def _copied_duration(self):
-        """Duration that would make this right-hand bar identical to the previous one."""
-        prev = self.prev_rh
-        if self.hand != "<|rh|>" or self.pending_onset is None or not prev:
+        """Duration that would make this hand an exact copy of the previous bar."""
+        prev = self.prev_events.get(self.hand) or ()
+        cur = self.cur_events.get(self.hand) or []
+        if self.pending_onset is None or not prev or len(cur) + 1 != len(prev):
             return None
-        if len(self.cur_rh) + 1 != len(prev):
-            return None
-        if tuple(self.cur_rh) != prev[:-1]:
-            return None
-        if self.pending_onset != prev[-1][0]:
+        if tuple(cur) != prev[:-1] or self.pending_onset != prev[-1][0]:
             return None
         return prev[-1][1]
 
     def decisions(self):
-        """Token ids to ban, and ids to subtract `pitch_penalty` from, for the next token."""
-        bans, pens = [], []
+        """Hard bans, then `(penalty, token ids)` groups, for the next token."""
+        bans, groups = [], []
+
+        def penalize(amount, ids):
+            ids = [i for i in ids if isinstance(i, int)]
+            if ids:
+                groups.append((float(amount), ids))
+
         if self.prev_q:
             for bpm, i in self.tempo_ids.items():
                 if bpm != self.prev_q and abs(bpm - self.prev_q) / self.prev_q <= self.tempo_ratio:
@@ -225,24 +258,68 @@ class ScoreConstraints(LogitsProcessor):
             for step, i in self.onset_ids.items():
                 if step >= self.bar_len:
                     bans.append(i)
-        if self.phase == "pitch" and self.scale:
-            root, pcs = self.scale
+            prev = self.prev_events.get(self.hand) or ()
+            cur = self.cur_events.get(self.hand) or []
+            if len(cur) < len(prev):
+                grid = max(1, self.spb // 2)
+                beat = prev[len(cur)][0] // grid
+                penalize(self.rhythm_penalty, [i for step, i in self.onset_ids.items() if step // grid == beat])
+            if self.note_count and self.bar_len and 1 - len(self.covered) / self.bar_len > self.silence_limit:
+                penalize(self.silence_penalty, [self.bar_id, self.end_id])
+        if self.phase == "pitch":
             hard = self.chromatic_count >= self.chromatic_budget
-            for pitch, i in self.pit_ids.items():
-                if (pitch - root) % 12 not in pcs:
-                    (bans if hard else pens).append(i)
+            if hard:
+                bans.extend(self.acc_ids)
+            else:
+                penalize(self.pitch_penalty, self.acc_ids)
+            if self.chord and self.key:
+                root, intervals = scale_pcs(self.key)
+                outside = []
+                for sd, i in self.sd_ids.items():
+                    if (root + intervals[sd - 1]) % 12 not in self.chord:
+                        outside.append(i)
+                penalize(self.pitch_penalty, outside)
+            if self.scale:
+                root, pcs = self.scale
+                off = [i for pitch, i in self.pit_ids.items() if (pitch - root) % 12 not in pcs]
+                if hard:
+                    bans.extend(off)
+                else:
+                    penalize(self.pitch_penalty, off)
             dur = self._copied_duration()
             if dur in self.dur_ids:
-                bans.append(self.dur_ids[dur])
-        return bans, pens
+                penalize(self.rhythm_penalty, [self.dur_ids[dur]])
+        return bans, groups
 
     def _apply(self, scores):
         n = scores.shape[-1]
-        bans, pens = self.decisions()
-        bans = [i for i in dict.fromkeys(bans) if 0 <= i < n]
-        pens = [i for i in dict.fromkeys(pens) if 0 <= i < n and i not in bans]
-        if bans:
-            scores[:, bans] = float("-inf")
-        if pens:
-            scores[:, pens] = scores[:, pens] - self.pitch_penalty
+        bans, groups = self.decisions()
+        banned = {i for i in bans if 0 <= i < n}
+        applied = []
+        for amount, ids in groups:
+            keep = []
+            for i in dict.fromkeys(ids):
+                if 0 <= i < n and i not in banned:
+                    keep.append(i)
+                    banned.add(i)  # a token is penalized once, by the first group that names it
+            if keep:
+                applied.append((amount, keep))
+        banned = [i for i in dict.fromkeys(bans) if 0 <= i < n]
+        # A Python-list index builds a CPU index tensor. Unsloth's sampler is a
+        # Triton kernel and rejects that with "cpu tensor?".
+        index_fill = getattr(scores, "index_fill_", None)
+        if index_fill is None:
+            if banned:
+                scores[:, banned] = float("-inf")
+            for amount, ids in applied:
+                scores[:, ids] = scores[:, ids] - amount
+            return scores
+        import torch
+        device, dtype = scores.device, scores.dtype
+        if banned:
+            scores.index_fill_(1, torch.tensor(banned, device=device, dtype=torch.long), torch.finfo(dtype).min)
+        for amount, ids in applied:
+            idx = torch.tensor(ids, device=device, dtype=torch.long)
+            delta = torch.full((scores.shape[0], idx.numel()), -amount, device=device, dtype=dtype)
+            scores.index_add_(1, idx, delta)
         return scores

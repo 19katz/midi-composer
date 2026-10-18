@@ -6,11 +6,12 @@ import re
 import numpy as np
 import pretty_midi
 
-from .codec import HANDS, _key_name, _ts_steps, decode
+from .codec import HANDS, _key_name, _ts_steps, decode, parse_hand_notes
 from .dataset import meta_fields, split_piece
 from .vocab import parse_pit, parse_tagged_int
 
-_MUSIC = re.compile(r"<\|(?:v|t|d|pit|ped_on|ped_off)_")
+_NOTE_LINES = ("<|mel|>",) + HANDS
+_MUSIC = re.compile(r"<\|(?:v|t|d|pit|sd|oct|acc|ped_on|ped_off)_")
 
 
 def to_pretty_midi(text):
@@ -31,7 +32,7 @@ def pitch_class_hist(pm):
 
 
 def hand_lines(text):
-    return [l for l in text.splitlines() if l.split(" ", 1)[0] in HANDS and len(l.split()) > 1]
+    return [l for l in text.splitlines() if l.split(" ", 1)[0] in _NOTE_LINES and len(l.split()) > 1]
 
 
 _MAJOR = {0, 2, 4, 5, 7, 9, 11}
@@ -43,25 +44,20 @@ def _scale(key):
     return (number % 12, _MINOR if number >= 12 else _MAJOR)
 
 
-def _bar_events(bar, bar_len):
-    """(onset, duration, pitch, hand) for notes on the rh/lh lines."""
+def _bar_events(bar, bar_len, key=None):
+    """(onset, duration, pitch, hand). Melody counts as the right hand.
+
+    Onsets are not clamped here, so a note that starts past the bar still shows
+    up as silence. Decode is what clamps those onsets for playback.
+    """
     events = []
     for line in bar.splitlines()[1:]:
         tag = line.split(" ", 1)[0]
-        if tag not in HANDS:
+        if tag not in _NOTE_LINES:
             continue
-        onset, pitches = None, []
-        for tok in line.split()[1:]:
-            if tok.startswith("<|t_"):
-                onset, pitches = parse_tagged_int(tok, "t"), []
-            elif tok.startswith("<|pit_"):
-                pitches.append(parse_pit(tok))
-            elif tok.startswith("<|d_") and onset is not None:
-                dur = parse_tagged_int(tok, "d") or 1
-                for pitch in pitches:
-                    if pitch is not None:
-                        events.append((onset, dur, pitch, tag))
-                pitches = []
+        hand = "<|rh|>" if tag == "<|mel|>" else tag
+        for onset, dur, pitch, _vel in parse_hand_notes(line.split()[1:], key):
+            events.append((onset, dur, pitch, hand))
     return events
 
 
@@ -100,9 +96,14 @@ def surface_metrics(text, key=None):
             bar_len = _ts_steps("4/4", 12)
         bar_len = max(1, bar_len)
         q = next((parse_tagged_int(t, "q") for t in head.split() if t.startswith("<|q_")), None)
+        # Hold repeats the previous tempo, so a held bar counts as "no jump"
+        # rather than disappearing from the denominator.
         if q:
-            tempos.append(q)
-        events = _bar_events(bar, bar_len)
+            bpm = q
+            tempos.append(bpm)
+        elif "<|tempo_hold|>" in head and tempos:
+            tempos.append(tempos[-1])
+        events = _bar_events(bar, bar_len, key)
         covered = [False] * bar_len
         for onset, dur, pitch, _hand in events:
             weight = max(0, min(onset + dur, bar_len) - max(0, onset))
@@ -131,7 +132,7 @@ def _empty_bar_frac(bars):
         return 1.0
     empty = 0
     for bar in bars:
-        pits = sum(1 for l in bar.splitlines() if l.startswith(HANDS) for t in l.split() if parse_pit(t) is not None)
+        pits = sum(len(parse_hand_notes(l.split()[1:], None)) for l in bar.splitlines() if l.split(" ", 1)[0] in _NOTE_LINES)
         empty += pits == 0
     return empty / len(bars)
 

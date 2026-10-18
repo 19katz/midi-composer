@@ -56,11 +56,29 @@ def archive_stale_results(results_path, required_metric="notes_per_bar"):
     return dest
 
 
+# Corpus-level rates the rerank aims at. A piece is kept when it lands near these,
+# which is where the training MIDI actually sits, rather than at 0 or 1.
+_RERANK = {
+    "diatonic_frac": 0.85,
+    "rhythm_repeat_frac": 0.2,
+    "silence_frac": 0.05,
+    "tempo_jump_frac": 0.1,
+}
+
+
+def _rerank_distance(metrics):
+    return sum(abs(float(metrics.get(k, 1)) - v) for k, v in _RERANK.items())
+
+
 def run_eval(generate_fn, files, texts, descs, out_dir, tag, seeds=(0,), variant="styled_detailed",
-             max_chunks=40, train_lines=None, set_seed=None, settings=None, render=True, on_piece=None):
+             max_chunks=40, train_lines=None, set_seed=None, settings=None, render=True, on_piece=None,
+             select_best=False):
     """Compose from each file's brief for each seed, save outputs, and append results.
 
-    Pieces already logged for this tag and seed are skipped, so an interrupted run resumes.
+    Length is the original piece's bar count, so a generated prelude is as long as
+    the prelude. Pieces already logged for this tag and seed are skipped, so an
+    interrupted run resumes. With `select_best`, every seed is generated and only
+    the closest to the corpus rates is logged; the other seeds stay under `candidates`.
     `set_seed(seed)` is called before each piece so sampling is reproducible.
     """
     os.makedirs(out_dir, exist_ok=True)
@@ -68,22 +86,28 @@ def run_eval(generate_fn, files, texts, descs, out_dir, tag, seeds=(0,), variant
     archived = archive_stale_results(results_path)
     if archived:
         print(f"Archived old-format results to {archived}")
-    done = {(r["file"], r["seed"], r["tag"]) for r in load_results(results_path)}
+    logged = load_results(results_path)
+    done = {(r["file"], r["seed"], r["tag"]) for r in logged}
+    done_files = {(r["file"], r["tag"]) for r in logged}
     rows = []
     for f in files:
         if f not in descs or f not in texts:
             continue
+        if select_best and (f, tag) in done_files:
+            continue
         brief = descs[f].get(variant) or descs[f]["brief"]
         meta = meta_fields(texts[f].splitlines()[1])
         key, meter = meta.get("key"), meta.get("ts")
+        n_bars = int(meta.get("bars") or 0) or None
         reference = None
+        pending = []
         for seed in seeds:
-            if (f, seed, tag) in done:
+            if not select_best and (f, seed, tag) in done:
                 continue
             if set_seed:
                 set_seed(seed)
             start = time.time()
-            text = compose(generate_fn, brief, key=key, meter=meter, max_chunks=max_chunks)
+            text = compose(generate_fn, brief, key=key, meter=meter, bars=n_bars, max_chunks=max_chunks)
             seconds = round(time.time() - start, 1)
             if reference is None:
                 reference = evaluate(texts[f], requested_key=key, train_lines=train_lines)
@@ -103,6 +127,17 @@ def run_eval(generate_fn, files, texts, descs, out_dir, tag, seeds=(0,), variant
                 "paths": save_piece(text, os.path.join(out_dir, tag), f"{f[:-4]}__{tag}__s{seed}", render),
                 "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
+            pending.append(row)
+        if not pending:
+            continue
+        if select_best and len(pending) > 1:
+            pending.sort(key=lambda r: _rerank_distance(r["metrics"]))
+            winner = pending[0]
+            winner["candidates"] = [
+                {"seed": r["seed"], "metrics": r["metrics"], "paths": r["paths"]} for r in pending[1:]
+            ]
+            pending = [winner]
+        for row in pending:
             with open(results_path, "a") as fh:
                 fh.write(json.dumps(row) + "\n")
             rows.append(row)

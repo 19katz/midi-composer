@@ -3,24 +3,25 @@
 Format (each musical field is one vocabulary token; see vocab.py):
 
     <|piece_start|>
-    <|meta|> key=F_minor ts=12/8 bars=262 spb=12
+    <|meta|> key=F_minor ts=12/8 bars=262 spb=12 tempo=126
     <|plan|> Exposition:1-65 Development:66-135 ...      (optional; ignored by decode)
-    <|bar|> 1 <|pos_0|> <|q_126|> ts=12/8
-    <|rh|> <|v_6|> <|t_0|> <|pit_C5|> <|d_6|> <|v_5|> <|t_6|> <|pit_Ab4|> <|pit_C5|> <|d_6|>
-    <|lh|> <|v_4|> <|t_0|> <|pit_F2|> <|pit_C3|> <|d_36|>
+    <|bar|> 1 <|pos_0|> <|q_126|> <|ch_I|> <|rhythm_new|> <|phrase|> ts=12/8
+    <|mel|> <|v_6|> <|t_0|> <|sd_1|> <|oct_5|> <|d_6|>
+    <|rh|> <|v_5|> <|t_6|> <|sd_1|> <|oct_4|> <|sd_3|> <|oct_4|> <|d_6|>
+    <|lh|> <|v_4|> <|t_0|> <|sd_1|> <|oct_2|> <|sd_5|> <|oct_2|> <|d_36|>
     <|ped|> <|t_0|> <|ped_on|> <|t_18|> <|ped_off|>
     ...
     <|piece_end|>
 
-Bar lines: bar number (ordinary digits), `<|pos_N|>` = N% through the piece, `<|q_N|>` =
-average quarter-note BPM over the bar. `ts=` appears only when the time signature
-changes, and `len=` only when the bar's length in grid steps differs from what its
-time signature implies. Rubato within a bar is dropped.
+Notes are scale degrees of the header key (`<|sd_1|>`..`<|sd_7|>` plus `<|oct_N|>`),
+with `<|acc_N|>` only when the note leaves the scale. The top right-hand note at
+each attack is `<|mel|>`; the other chord tones stay on `<|rh|>`. `<|ch_|>` is the
+bar's triad and is ignored at playback. Tempo is an 8% bin, written only when the
+bin changes; other bars are `<|tempo_hold|>`. `<|rhythm_same|>` means this bar's
+attacks fall on the same eighth-note beats as the previous bar.
 
-Hand lines: `<|v_N|>` sets the velocity bin (0-7) for the events that follow.
-Each event is `<|t_onset|>` then one or more `<|pit_...|>` then `<|d_duration|>`.
-Onset is relative to the bar; onset and duration are in grid steps (`spb` steps per
-quarter note). Sustain pedal (CC64, binarized) is an optional `<|ped|>` line.
+`ts=` appears only when the meter changes, and `len=` only when the bar is irregular.
+Rubato within a bar is dropped. Onsets at or past the bar length are clamped on decode.
 """
 
 import bisect
@@ -32,10 +33,13 @@ import numpy as np
 import pretty_midi
 
 from .vocab import (
+    PHRASE_BARS,
+    chord_token,
     d_on,
+    degree_pitch,
     parse_pit,
     parse_tagged_int,
-    pit,
+    pitch_tokens,
     pos,
     t_on,
     tempo,
@@ -149,38 +153,131 @@ def encode(pm, spb=SPB, vel_bins=VEL_BINS):
         b = min(max(bisect.bisect_right(bar_steps, s) - 1, 0), n_bars - 1)
         ped_by_bar[b].append((s - bar_steps[b], on))
 
-    lines = ["<|piece_start|>", f"<|meta|> key={_key_name(pm)} ts={ts_changes[0][1]} bars={n_bars} spb={spb}"]
+    key = _key_name(pm)
+    # Opening tempo is also ordinary text, like the key. Later bars only restate
+    # it when the 8% bin changes.
+    opening_bpm = 120
+    lines = ["<|piece_start|>"]
     prev_ts = None
+    prev_bin = None
+    prev_pattern = None
+    body = []
     for b in range(n_bars):
         t0, t1 = bar_ticks[b], bar_ticks[b + 1]
         ts = ts_changes[max(bisect.bisect_right(ts_ticks, t0) - 1, 0)][1]
         seconds = pm.tick_to_time(t1) - pm.tick_to_time(t0)
         bpm = round(60 * (t1 - t0) / tpb / seconds) if seconds > 0 else 120
-        fields = ["<|bar|>", str(b + 1), pos(b / n_bars), tempo(bpm)]
+        if b == 0:
+            opening_bpm = bpm
+        bin_ = parse_tagged_int(tempo(bpm), "q")
+        pattern = _beat_pattern(events, b, spb)
+        rhythm = "<|rhythm_same|>" if prev_pattern and pattern == prev_pattern else "<|rhythm_new|>"
+        prev_pattern = pattern
+        pitches = [(p, dur) for h in HANDS for (on, dur, _vel), ps in events[h][b].items() for p in ps]
+        fields = ["<|bar|>", str(b + 1), pos(b / n_bars)]
+        if prev_bin is None or bin_ != prev_bin:
+            fields.append(tempo(bpm))
+            prev_bin = bin_
+        else:
+            fields.append("<|tempo_hold|>")
+        fields.append(chord_token(key, pitches))
+        fields.append(rhythm)
+        if b % PHRASE_BARS == 0:
+            fields.append("<|phrase|>")
         if ts != prev_ts:
             fields.append(f"ts={ts}")
         prev_ts = ts
         length = bar_steps[b + 1] - bar_steps[b]
         if length != _ts_steps(ts, spb) and b < n_bars - 1:
             fields.append(f"len={length}")
-        lines.append(" ".join(fields))
-        for h in HANDS:
-            toks, cur_vel = [h], None
-            for (on, dur, vel_bin), pitches in sorted(events[h][b].items()):
-                if vel_bin != cur_vel:
-                    toks.append(vel(vel_bin))
-                    cur_vel = vel_bin
-                toks.append(t_on(on))
-                toks.extend(pit(p) for p in sorted(set(pitches)))
-                toks.append(d_on(dur))
-            lines.append(" ".join(toks))
+        body.append(" ".join(fields))
+        mel, rh = _split_melody(sorted(events["<|rh|>"][b].items()))
+        body.append(_hand_line("<|mel|>", mel, key))
+        body.append(_hand_line("<|rh|>", rh, key))
+        body.append(_hand_line("<|lh|>", sorted(events["<|lh|>"][b].items()), key))
         if ped_by_bar[b]:
             ped = ["<|ped|>"]
             for on, state in ped_by_bar[b]:
                 ped += [t_on(on), "<|ped_on|>" if state else "<|ped_off|>"]
-            lines.append(" ".join(ped))
+            body.append(" ".join(ped))
+    lines.append(
+        f"<|meta|> key={key} ts={ts_changes[0][1]} bars={n_bars} spb={spb} tempo={tempo(opening_bpm)[4:-2]}"
+    )
+    lines.extend(body)
     lines.append("<|piece_end|>")
     return "\n".join(lines)
+
+
+def _beat_pattern(events, bar, spb):
+    """Eighth-note bins of every attack. A one-step nudge stays in the same bin."""
+    grid = max(1, spb // 2)
+    ons = []
+    for h in HANDS:
+        for (on, _dur, _vel), pitches in events[h][bar].items():
+            if pitches:
+                ons.append(on // grid)
+    return tuple(sorted(ons))
+
+
+def _split_melody(grouped):
+    """Highest pitch at each right-hand attack becomes the melody; the rest stay accompaniment."""
+    mel, rh = [], []
+    for key, pitches in grouped:
+        if not pitches:
+            continue
+        top = max(pitches)
+        mel.append((key, [top]))
+        rest = [p for p in pitches if p != top]
+        rest += [top] * (pitches.count(top) - 1)
+        if rest:
+            rh.append((key, rest))
+    return mel, rh
+
+
+def _hand_line(tag, grouped, key):
+    toks, cur_vel = [tag], None
+    for (on, dur, vel_bin), pitches in grouped:
+        if vel_bin != cur_vel:
+            toks.append(vel(vel_bin))
+            cur_vel = vel_bin
+        toks.append(t_on(on))
+        for p in pitches:
+            toks.extend(pitch_tokens(key, p))
+        toks.append(d_on(dur))
+    return " ".join(toks)
+
+
+def parse_hand_notes(rest, key, bar_len=None, default_vel=4):
+    """(onset, duration, pitch, velocity bin). Onsets past the bar are clamped."""
+    events, onset, pitches = [], None, []
+    acc = sd = None
+    vel_bin = default_vel
+    for tok in rest:
+        if tok.startswith("<|v_"):
+            vel_bin = parse_tagged_int(tok, "v") if parse_tagged_int(tok, "v") is not None else vel_bin
+        elif tok.startswith("<|t_"):
+            onset = parse_tagged_int(tok, "t") or 0
+            if bar_len and onset >= bar_len:
+                onset = bar_len - 1
+            pitches, acc, sd = [], 0, None
+        elif tok.startswith("<|acc_"):
+            acc = parse_tagged_int(tok, "acc") or 0
+        elif tok.startswith("<|sd_"):
+            sd = parse_tagged_int(tok, "sd")
+        elif tok.startswith("<|oct_") and sd:
+            pitches.append((degree_pitch(key, sd, parse_tagged_int(tok, "oct") or 4, acc or 0), vel_bin))
+            sd, acc = None, 0
+        elif tok.startswith("<|pit_"):
+            p = parse_pit(tok)
+            if p is not None:
+                pitches.append((p, vel_bin))
+        elif tok.startswith("<|d_") and onset is not None:
+            dur = max(1, parse_tagged_int(tok, "d") or 1)
+            for p, v in pitches:
+                if p is not None and 0 <= p <= 127:
+                    events.append((onset, dur, p, v))
+            pitches = []
+    return events
 
 
 _FIELD = re.compile(r"(\w+)=(\S+)")
@@ -219,26 +316,14 @@ def decode(text, vel_bins=VEL_BINS):
             q = next((parse_tagged_int(t, "q") for t in rest if t.startswith("<|q_")), None)
             if q:
                 bpm = q
+            # <|tempo_hold|> keeps the previous bar's tempo. A new <|q_N|> is a new bin.
             tempo_events.append((bar_start, bpm))
-        elif tag in HANDS and in_bar:
-            vel_bin, onset, pitches = vel_bins // 2, 0, []
-            for tok in rest:
-                if tok.startswith("<|v_"):
-                    vel_bin = parse_tagged_int(tok, "v") or vel_bin
-                elif tok.startswith("<|t_"):
-                    onset = parse_tagged_int(tok, "t") or 0
-                    pitches = []
-                elif tok.startswith("<|pit_"):
-                    p = parse_pit(tok)
-                    if p is not None:
-                        pitches.append(p)
-                elif tok.startswith("<|d_"):
-                    dur = max(1, parse_tagged_int(tok, "d") or 1)
-                    velocity = min(127, vel_bin * (128 // vel_bins) + 128 // vel_bins // 2)
-                    for p in pitches:
-                        if 0 <= p <= 127:
-                            notes[tag].append((bar_start + onset, dur, p, velocity))
-                    pitches = []
+        elif tag in ("<|mel|>",) + HANDS and in_bar:
+            # Melody is the top of the right hand; playback merges it back onto that track.
+            dest = "<|rh|>" if tag == "<|mel|>" else tag
+            for onset, dur, pitch, vel_bin in parse_hand_notes(rest, key, bar_len, vel_bins // 2):
+                velocity = min(127, vel_bin * (128 // vel_bins) + 128 // vel_bins // 2)
+                notes[dest].append((bar_start + onset, dur, pitch, velocity))
         elif tag == "<|ped|>" and in_bar:
             onset = 0
             for tok in rest:
@@ -304,22 +389,37 @@ def transpose_key(key, semis):
 
 
 def transpose(text, semis, piano_range=PIANO_RANGE):
-    """Shift every pitch and the key by `semis`. Returns None if any note leaves the piano range."""
+    """Shift the key by `semis`. Degrees stay put, so the sounding pitches move with the key.
+
+    Returns None if any sounding pitch would leave the piano. Legacy `<|pit_|>` scores
+    are rewritten note by note.
+    """
+    if not semis:
+        return text
     lo, hi = piano_range
+    meta = next((ln for ln in text.splitlines() if ln.startswith("<|meta|>")), "")
+    key = dict(_FIELD.findall(meta)).get("key")
+    sounding = []
+    for line in text.splitlines():
+        toks = line.split()
+        if toks and toks[0] in ("<|mel|>",) + HANDS:
+            sounding += [p for _o, _d, p, _v in parse_hand_notes(toks[1:], key)]
+    if any(not lo <= p + semis <= hi for p in sounding):
+        return None
+    # Degree spellings are relative to the key, so only the key name changes.
+    # A leftover absolute pitch token has to move explicitly.
+    from .vocab import pit
     lines = []
     for line in text.splitlines():
         toks = line.split()
-        if toks and toks[0] in HANDS:
+        if toks and toks[0] in ("<|mel|>",) + HANDS and any(t.startswith("<|pit_") for t in toks):
             out = []
             for tok in toks:
                 p = parse_pit(tok)
                 if p is None:
                     out.append(tok)
-                    continue
-                p2 = p + semis
-                if not lo <= p2 <= hi:
-                    return None
-                out.append(pit(p2))
+                else:
+                    out.append(pit(p + semis))
             line = " ".join(out)
         elif toks and toks[0] == "<|meta|>":
             line = re.sub(r"key=(\S+)", lambda m: f"key={transpose_key(m[1], semis)}", line)

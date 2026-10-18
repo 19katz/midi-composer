@@ -12,7 +12,7 @@ from midicomposer.compose import compose
 from midicomposer.dataset import build_examples, split_by_work, split_piece, windows, work_id
 from midicomposer.describe import fallback_description
 from midicomposer.evaluate import evaluate
-from midicomposer.vocab import approx_tokens, music_tokens, parse_pit, pit
+from midicomposer.vocab import approx_tokens, degree_pitch, music_tokens, parse_pit, pitch_tokens, pit, tempo
 
 MIDI_DIR = os.path.expanduser(os.environ.get("MIDI_DIR", "~/MIDI"))
 FILES = sorted(glob.glob(os.path.join(MIDI_DIR, "*.mid")))
@@ -64,7 +64,7 @@ def test_synthetic_roundtrip_is_byte_identical():
     decode(text).save(file=buf)
     buf.seek(0)
     assert encode(pretty_midi.PrettyMIDI(buf)) == text
-    assert "<|ped_on|>" in text and "<|pit_C5|>" in text
+    assert "<|ped_on|>" in text and "<|sd_1|>" in text and "<|pit_" not in text
 
 
 @needs_midi
@@ -109,11 +109,34 @@ def test_surface_metrics_key_rhythm_silence_tempo():
 
 
 def test_music_vocab_is_unique_and_covers_piano():
+    from midicomposer.vocab import tempo_centers
+
     toks = music_tokens()
     assert len(toks) == len(set(toks))
-    assert pit(60) in toks and pit(21) in toks and pit(108) in toks
+    assert "<|sd_1|>" in toks and "<|sd_7|>" in toks and "<|oct_4|>" in toks
+    assert "<|tempo_hold|>" in toks and "<|mel|>" in toks and "<|ch_V|>" in toks
+    assert pit(60) not in toks
     assert parse_pit(pit(61)) == 61
-    assert approx_tokens("<|rh|> <|v_2|> <|t_0|> <|pit_C5|> <|d_6|>") == 5
+    # 20 BPM to 260 BPM in 8% steps is a few dozen bins, not one token per BPM.
+    assert 30 <= len(tempo_centers()) <= 40
+    assert all(tempo(c) in toks for c in tempo_centers())
+    assert approx_tokens("<|rh|> <|v_2|> <|t_0|> <|sd_1|> <|oct_5|> <|d_6|>") == 6
+
+
+def test_canonical_pitch_roundtrip():
+    for key in ("C_Major", "A_minor", "F#_Major", "Bb_minor"):
+        for midi in range(21, 109):
+            toks = pitch_tokens(key, midi)
+            acc = sd = octave = 0
+            for tok in toks:
+                if tok.startswith("<|acc_"):
+                    acc = int(tok[6:-2])
+                elif tok.startswith("<|sd_"):
+                    sd = int(tok[5:-2])
+                elif tok.startswith("<|oct_"):
+                    octave = int(tok[6:-2])
+            assert degree_pitch(key, sd, octave, acc) == midi
+            assert sum(tok.startswith("<|acc_") for tok in toks) <= 1
 
 
 def test_transpose_key():
@@ -222,74 +245,146 @@ class _Tok:
         return [self.t2i[t] for t in tokens]
 
 
+def _penalized(groups, amount=None):
+    ids = []
+    for penalty, group in groups:
+        if amount is None or penalty == amount:
+            ids.extend(group)
+    return ids
+
+
 def test_score_constraints_mask_key_rhythm_onset_and_tempo():
     import numpy as np
     from midicomposer.constraints import ScoreConstraints
+    from midicomposer.vocab import tempo_centers
 
     tok = _Tok()
-    proc = ScoreConstraints(tok, pitch_penalty=8, chromatic_budget=2, tempo_ratio=0.08)
-    # Prompt ends on a finished bar: RH eighth-eighth, tempo 100, 3/8 so the bar is 18 steps.
-    # C# minor contains F#; C and D and F are the chromatic notes used below.
+    qtok = tempo(100)
+    qval = int(qtok[4:-2])
+    proc = ScoreConstraints(tok, pitch_penalty=2, chromatic_budget=2, rhythm_penalty=4, tempo_ratio=0.08)
+    # Prompt ends on a finished bar. C# minor, RH eighth-eighth, 3/8 so the bar is 18 steps.
     opening = tok.ids(
         "Key", ":", " C#", " minor", "\n",
         "Meter", ":", " 3/8", "\n",
-        "<|bar|>", "<|q_100|>",
-        "<|rh|>", "<|t_0|>", "<|pit_Cs4|>", "<|d_6|>", "<|t_6|>", "<|pit_E4|>", "<|d_6|>",
+        "<|bar|>", qtok,
+        "<|rh|>", "<|t_0|>", "<|sd_1|>", "<|oct_4|>", "<|d_6|>",
+        "<|t_6|>", "<|sd_3|>", "<|oct_4|>", "<|d_6|>",
         "<|lh|>",
     )
     scores = np.zeros((1, max(tok.i2t) + 1))
     proc(np.array([opening]), scores)
-    assert proc.prev_rh == ((0, 6), (6, 6))
-    assert proc.prev_q == 100
+    assert proc.prev_events["<|rh|>"] == ((0, 6), (6, 6))
+    assert proc.prev_q == qval
     assert proc.bar_len == 18
 
-    # Continuation copies the first onset and duration, then the second onset.
-    # The duration that would finish the copy is banned; the shared downbeat is not.
-    copied = tok.ids("<|bar|>", "<|rh|>", "<|t_0|>", "<|pit_Cs4|>", "<|d_6|>", "<|t_6|>")
-    proc(np.array([opening + copied]), scores)
-    bans, pens = proc.decisions()
-    assert tok.t2i["<|d_6|>"] in bans
+    # Same eighth-note beat as the previous bar is penalized, including the downbeat.
+    # It is not banned: real pieces repeat a beat about a fifth of the time.
+    beat = ScoreConstraints(tok, pitch_penalty=2, chromatic_budget=2, rhythm_penalty=4, tempo_ratio=0.08)
+    beat(np.array([opening]), scores)
+    beat(np.array([opening + tok.ids("<|bar|>", "<|rh|>")]), scores)
+    bans, groups = beat.decisions()
+    assert tok.t2i["<|t_0|>"] in _penalized(groups, 4)
     assert tok.t2i["<|t_0|>"] not in bans
-    assert tok.t2i["<|q_100|>"] not in bans
-    assert tok.t2i["<|q_101|>"] in bans  # 1% wobble
-    assert tok.t2i["<|q_120|>"] not in bans  # real jump
-    assert tok.t2i["<|t_18|>"] not in bans  # pitch position, not onset position
-    fs = tok.t2i["<|pit_Fs4|>"]  # F# is outside C# minor (C# D# E F# G# A B) — F# IS in C# minor!
-    # C# minor: C# D# E F# G# A B. Chromatic: C, D, F, G, A#...
-    # Use C natural, pit_C4.
-    cnat = tok.t2i["<|pit_C4|>"]
-    assert cnat in pens and fs not in pens
+    assert tok.t2i["<|t_6|>"] not in _penalized(groups, 4)
 
-    # Two chromatic notes fill the budget; the next out-of-key pitch is banned.
-    more = tok.ids("<|pit_C4|>", "<|pit_D4|>")
-    proc(np.array([opening + copied + more]), scores)
-    bans, pens = proc.decisions()
-    assert tok.t2i["<|pit_F4|>"] in bans
-    assert fs not in bans
-
-    # A different first duration breaks the copy, so the old completing duration is free.
-    proc2 = ScoreConstraints(tok, pitch_penalty=8, chromatic_budget=2, tempo_ratio=0.08)
-    proc2(np.array([opening]), np.zeros((1, max(tok.i2t) + 1)))
-    diverged = tok.ids("<|bar|>", "<|rh|>", "<|t_0|>", "<|pit_Cs4|>", "<|d_8|>", "<|t_6|>")
-    proc2(np.array([opening + diverged]), np.zeros((1, max(tok.i2t) + 1)))
-    bans, _ = proc2.decisions()
+    # The duration that would finish an exact copy is penalized the same way.
+    copied = tok.ids("<|bar|>", "<|rh|>", "<|t_0|>", "<|sd_1|>", "<|oct_4|>", "<|d_6|>", "<|t_6|>")
+    proc(np.array([opening + copied]), scores)
+    bans, groups = proc.decisions()
+    assert tok.t2i["<|d_6|>"] in _penalized(groups, 4)
     assert tok.t2i["<|d_6|>"] not in bans
+    assert tok.t2i[qtok] not in bans
+    near = [c for c in tempo_centers() if c != qval and abs(c - qval) / qval <= 0.08]
+    far = [c for c in tempo_centers() if abs(c - qval) / qval > 0.08]
+    assert near and all(tok.t2i[f"<|q_{c}|>"] in bans for c in near)
+    assert any(tok.t2i[f"<|q_{c}|>"] not in bans for c in far)
+    # Accidentals are penalized, not removed. Scale degrees of the key are not.
+    assert tok.t2i["<|acc_-1|>"] in _penalized(groups, 2)
+    assert tok.t2i["<|sd_1|>"] not in _penalized(groups, 2)
 
-    # Onset position: t_18 is past a 3/8 bar. len=10 shortens it further.
+    # Two accidentals fill the budget; another accidental is then banned.
+    more = tok.ids("<|acc_-1|>", "<|acc_1|>")
+    proc(np.array([opening + copied + more]), scores)
+    bans, groups = proc.decisions()
+    assert tok.t2i["<|acc_2|>"] in bans
+    assert tok.t2i["<|sd_1|>"] not in bans
+
+    # A different first duration is not an exact copy, so the old duration is free.
+    proc2 = ScoreConstraints(tok, pitch_penalty=2, chromatic_budget=2, rhythm_penalty=4, tempo_ratio=0.08)
+    proc2(np.array([opening]), np.zeros((1, max(tok.i2t) + 1)))
+    diverged = tok.ids("<|bar|>", "<|rh|>", "<|t_0|>", "<|sd_1|>", "<|oct_4|>", "<|d_8|>", "<|t_6|>")
+    proc2(np.array([opening + diverged]), np.zeros((1, max(tok.i2t) + 1)))
+    _bans, groups = proc2.decisions()
+    assert tok.t2i["<|d_6|>"] not in _penalized(groups, 4)
+
+    # Onset at or past the bar is still a hard ban. len=20 shortens a longer bar.
     proc3 = ScoreConstraints(tok)
     proc3(np.array([opening]), np.zeros((1, max(tok.i2t) + 1)))
     proc3(np.array([opening + tok.ids("<|bar|>", "<|rh|>")]), np.zeros((1, max(tok.i2t) + 1)))
-    bans, _ = proc3.decisions()
+    bans, _groups = proc3.decisions()
     assert tok.t2i["<|t_18|>"] in bans and tok.t2i["<|t_0|>"] not in bans
-    short = tok.ids("<|bar|>", "len", "=", "20")
-    # "20" is the token; len=20 would be wrong because bar steps of 20 still bans t_20.
-    # Feed characters that concatenate to len=10. The vocab has "20" only.
-    # Use header pieces "len" "=" and a digit token. Add by consuming raw through known tokens:
-    # token " " exists. Build len=10 from tokens we have: there is no "10" or "1" "0".
-    # "20" makes len=20. Ban t_20, allow t_18.
     proc4 = ScoreConstraints(tok)
     proc4(np.array([opening]), np.zeros((1, max(tok.i2t) + 1)))
     proc4(np.array([opening + tok.ids("<|bar|>", "len", "=", "20", "<|rh|>")]), np.zeros((1, max(tok.i2t) + 1)))
-    bans, _ = proc4.decisions()
+    bans, _groups = proc4.decisions()
     assert proc4.bar_len == 20
     assert tok.t2i["<|t_20|>"] in bans and tok.t2i["<|t_18|>"] not in bans
+
+    # A chord token penalizes degrees outside that chord. I in C# minor is C# E G#.
+    proc5 = ScoreConstraints(tok, pitch_penalty=2, chromatic_budget=16)
+    proc5(np.array([opening]), np.zeros((1, max(tok.i2t) + 1)))
+    proc5(np.array([opening + tok.ids("<|bar|>", "<|ch_I|>", "<|rh|>", "<|t_0|>")]), np.zeros((1, max(tok.i2t) + 1)))
+    _bans, groups = proc5.decisions()
+    pitched = _penalized(groups, 2)
+    assert tok.t2i["<|sd_2|>"] in pitched and tok.t2i["<|sd_1|>"] not in pitched
+
+
+def test_weighted_loss_upweights_melody_not_figuration():
+    torch = pytest.importorskip("torch")
+    from midicomposer.weighted_loss import _ids, _weights
+
+    tok = _Tok()
+    special = _ids(tok, lambda t: (
+        t.startswith("<|ch_") or t.startswith("<|q_")
+        or t in ("<|rhythm_same|>", "<|rhythm_new|>", "<|tempo_hold|>", "<|phrase|>", "<|mel|>")
+    ))
+    boundary = _ids(tok, lambda t: t in ("<|rh|>", "<|lh|>", "<|ped|>", "<|bar|>", "<|piece_end|>"))
+    mel = tok.t2i["<|mel|>"]
+    sd = tok.t2i["<|sd_1|>"]
+    labels = torch.tensor([[mel, sd, tok.t2i["<|rh|>"], sd, -100]])
+    w = _weights(labels, special, boundary, mel, 3.0)
+    assert w[0].tolist() == [3.0, 3.0, 1.0, 1.0, 0.0]
+
+
+def test_new_token_rows_receive_gradient(tmp_path):
+    torch = pytest.importorskip("torch")
+    from torch import nn
+    from midicomposer.token_rows import attach_new_token_training, load_new_token_rows, save_new_token_rows
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(6, 3)
+            self.head = nn.Linear(3, 6, bias=False)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_output_embeddings(self):
+            return self.head
+
+        def forward(self, ids):
+            return self.head(self.embed(ids))
+
+    model = Tiny()
+    attach_new_token_training(model, 4, 2)
+    assert model.embed.weight.requires_grad is False
+    assert model.embed.new_token_rows.requires_grad
+    model(torch.tensor([[4, 5]])).sum().backward()
+    assert model.embed.new_token_rows.grad.abs().sum() > 0
+    assert model.head.new_token_rows.grad.abs().sum() > 0
+    path = tmp_path / "new_token_rows.pt"
+    save_new_token_rows(model, path)
+    fresh = Tiny()
+    load_new_token_rows(fresh, path)
+    assert torch.allclose(fresh.embed.new_token_rows, model.embed.new_token_rows)

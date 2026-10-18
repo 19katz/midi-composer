@@ -79,19 +79,48 @@ def describe(midi_path, client, model, audio_dir):
     return {"file": os.path.basename(midi_path), **desc}
 
 
+def section_plan(per_bar, min_len=8):
+    """Section spans from the score itself: a new span when density or register jumps.
+
+    No piece title and no composer name. The model should follow the shape, not the work.
+    """
+    if not per_bar:
+        return []
+    starts = [per_bar[0]["bar"]]
+    for i in range(1, len(per_bar)):
+        prev, cur = per_bar[i - 1], per_bar[i]
+        if cur["bar"] - starts[-1] < min_len:
+            continue
+        density = prev["notes"] and cur["notes"] and max(prev["notes"], cur["notes"]) >= 2 * min(prev["notes"], cur["notes"])
+        register = prev["hi"] and cur["hi"] and abs(cur["hi"] - prev["hi"]) >= 12
+        if density or register:
+            starts.append(cur["bar"])
+    names = ("opening", "continuation", "contrast", "return")
+    sections = []
+    last = per_bar[-1]["bar"]
+    for i, start in enumerate(starts):
+        end = starts[i + 1] - 1 if i + 1 < len(starts) else last
+        sections.append({"name": names[i % len(names)], "bars": [start, end]})
+    return sections
+
+
 def fallback_description(midi_path):
-    """Metadata-only description for smoke-testing the pipeline without an API key."""
+    """Brief built from the score: length, key, meter, tempo word, and section spans."""
     f = extract_features(midi_path)
     meta = f["metadata"]
-    composer = next((name for m in meta for key, name in COMPOSERS.items() if key in m.lower()), None)
     marking = next((m for m in meta if any(w in m.lower() for w in TEMPO_WORDS) and len(m) < 40), "moderato")
-    brief = f"Write a solo piano piece of about {f['n_bars']} bars, marked {marking}."
-    styled = brief[:-1] + (f", in the style of {composer}." if composer else ".")
+    meter = f["time_signatures"][0] if f["time_signatures"] else "4/4"
+    sections = section_plan(f["per_bar"])
+    span = "; ".join(f"{s['name']} bars {s['bars'][0]}-{s['bars'][1]}" for s in sections)
+    brief = (
+        f"Write a solo piano piece of about {f['n_bars']} bars in {f['key']}, {meter}, marked {marking}."
+        + (f" Sections: {span}." if span else "")
+    )
     return {
         "file": os.path.basename(midi_path),
         "brief": brief, "paragraph": brief, "detailed": brief,
-        "styled_brief": styled, "styled_paragraph": styled, "styled_detailed": styled,
-        "sections": [],
+        "styled_brief": brief, "styled_paragraph": brief, "styled_detailed": brief,
+        "sections": sections,
         "fallback": True,
     }
 

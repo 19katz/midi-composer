@@ -14,7 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE = os.path.join(ROOT, "notebooks", "pipeline.ipynb")
 TARGET = os.path.join(ROOT, "notebooks", "midi_composer_colab.ipynb")
 PKG = os.path.join(ROOT, "src", "midicomposer")
-MODULES = ["__init__", "vocab", "codec", "features", "describe", "dataset", "compose", "evaluate", "constraints", "runs"]
+MODULES = ["__init__", "vocab", "codec", "features", "describe", "dataset", "compose", "evaluate", "constraints", "runs", "token_rows", "weighted_loss"]
 LIB = "midicomposer_lib"
 
 INTRO = """**Standalone version.** Upload this file to Colab (File > Upload notebook) and run it; nothing else is needed. The library code is in the "Library code" section below. It is generated from `src/midicomposer/` in the repo by `scripts/build_standalone.py`, so make code changes there.
