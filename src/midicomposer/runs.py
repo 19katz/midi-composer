@@ -67,7 +67,15 @@ _RERANK = {
 
 
 def _rerank_distance(metrics):
-    return sum(abs(float(metrics.get(k, 1)) - v) for k, v in _RERANK.items())
+    """Distance from the corpus rates. A missing rate (no notes, or one bar) counts as a total miss."""
+    total = 0.0
+    for key, target in _RERANK.items():
+        got = (metrics or {}).get(key)
+        if isinstance(got, bool) or not isinstance(got, (int, float)):
+            total += 1.0
+        else:
+            total += abs(float(got) - target)
+    return total
 
 
 def run_eval(generate_fn, files, texts, descs, out_dir, tag, seeds=(0,), variant="styled_detailed",

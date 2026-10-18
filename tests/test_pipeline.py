@@ -174,6 +174,13 @@ def test_work_split_keeps_movements_together():
     assert not {work_id(f) for f in train} & {work_id(f) for f in test}
 
 
+def test_rerank_treats_a_missing_rate_as_a_miss():
+    from midicomposer.runs import _rerank_distance
+
+    assert _rerank_distance({"diatonic_frac": 0.85, "rhythm_repeat_frac": None, "silence_frac": 0.05, "tempo_jump_frac": 0.1}) == 1.0
+    assert _rerank_distance({}) == 4.0
+
+
 def test_archive_stale_results(tmp_path):
     from midicomposer.runs import archive_stale_results, load_results
 
