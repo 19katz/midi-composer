@@ -4,10 +4,13 @@ Applied inside `model.generate`. Real pieces sit in the middle of these axes
 (about 83% diatonic, 19% repeated rhythm, 8% silence), so the defaults penalize
 the extremes instead of banning them:
 
-- accidentals and non-chord degrees get `pitch_penalty` (small). A hard ban only
+- accidentals and non-chord degrees get `pitch_penalty`. A hard ban only
   starts after `chromatic_budget` accidentals in the bar.
 - an onset whose eighth-note beat matches the previous bar, at the same place in
   the bar, gets `rhythm_penalty`. The duration that would finish an exact copy does too.
+  Both amounts are subtracted from the logits and then divided by the sampling
+  temperature, so 2 and 4 behave like bans (about 9x and 85x at temperature 0.9).
+  The defaults are a nudge: chromatic notes and a repeated beat stay possible.
 - ending a bar that is still mostly empty gets `silence_penalty`. An empty bar is left alone.
 - an onset at or past the bar length is still banned. So is a tempo token within
   `tempo_ratio` of the previous bar, other than the previous tempo itself.
@@ -31,7 +34,7 @@ _HANDS = ("<|mel|>", "<|rh|>", "<|lh|>")
 
 
 class ScoreConstraints(LogitsProcessor):
-    def __init__(self, tokenizer, pitch_penalty=2.0, chromatic_budget=16, rhythm_penalty=4.0,
+    def __init__(self, tokenizer, pitch_penalty=0.5, chromatic_budget=16, rhythm_penalty=1.0,
                  silence_penalty=2.0, silence_limit=0.15, tempo_ratio=0.08):
         self.tokenizer = tokenizer
         self.pitch_penalty = float(pitch_penalty)
