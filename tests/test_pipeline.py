@@ -219,6 +219,37 @@ def test_run_eval_saves_logs_and_resumes(piece, tmp_path):
     assert len(run_eval(replay, **{**args, "tag": "ckpt-b", "seeds": (0,)})) == 1
 
 
+def test_piece_stop_ends_on_the_bar_after_the_budget():
+    from midicomposer.compose import PieceStop
+
+    class _Seq:
+        def __init__(self, ids):
+            self.ids = list(ids)
+            self.shape = (len(self.ids),)
+
+        def __getitem__(self, item):
+            return _Seq(self.ids[item])
+
+        def tolist(self):
+            return list(self.ids)
+
+    class _Batch:
+        def __init__(self, ids):
+            self.row = _Seq(ids)
+
+        def __getitem__(self, _i):
+            return self.row
+
+    # Prompt is 3 tokens. max_bars=2 stops when the third bar token arrives.
+    stop = PieceStop(prompt_len=3, bar_id=1, end_id=9, max_bars=2)
+    assert stop(_Batch([0, 0, 0, 1, 2]), None) is False
+    assert stop(_Batch([0, 0, 0, 1, 2, 1, 2]), None) is False
+    assert stop(_Batch([0, 0, 0, 1, 2, 1, 2, 1]), None) is True
+
+    done = PieceStop(prompt_len=1, bar_id=1, end_id=9, max_bars=8)
+    assert done(_Batch([0, 9]), None) is True
+
+
 @needs_midi
 def test_compose_with_replayed_model(piece):
     """A fake model that replays the real piece window by window must reassemble it."""

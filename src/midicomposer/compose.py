@@ -1,6 +1,53 @@
 """Chunked generation: header + opening bars, then continuations until the piece ends."""
 
+import inspect
+
 from .dataset import approx_tokens, make_prompt, meta_fields, split_piece
+
+
+class PieceStop:
+    """Stop a chunk once it has written the bars it was asked for, or `<|piece_end|>`.
+
+    The token that opens the next bar is what shows the previous bar is finished,
+    so `max_bars=40` stops on the 41st `<|bar|>`, not the 40th. Tokens in the
+    prompt are not counted.
+    """
+
+    def __init__(self, prompt_len, bar_id, end_id, max_bars):
+        self.seen = int(prompt_len)
+        self.bar_id = bar_id
+        self.end_id = end_id
+        self.max_bars = None if max_bars is None else int(max_bars)
+        self.bars = 0
+
+    def __call__(self, input_ids, scores=None, **kwargs):
+        row = input_ids[0]
+        new = row[self.seen:]
+        ids = new.tolist() if hasattr(new, "tolist") else list(new)
+        self.seen = row.shape[0] if hasattr(row, "shape") else len(row)
+        for i in ids:
+            if self.end_id is not None and i == self.end_id:
+                return True
+            if i == self.bar_id:
+                self.bars += 1
+                if self.max_bars is not None and self.bars > self.max_bars:
+                    return True
+        return False
+
+
+def _call_generate(generate_fn, messages, max_bars):
+    """Pass the remaining bar count when the sampler accepts it.
+
+    Older one-argument callables, including the tests, keep working.
+    """
+    try:
+        params = inspect.signature(generate_fn).parameters
+    except (TypeError, ValueError):
+        return generate_fn(messages)
+    var = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if "max_bars" in params or var:
+        return generate_fn(messages, max_bars=max_bars)
+    return generate_fn(messages)
 
 
 def _complete_bars(text):
@@ -27,9 +74,9 @@ def compose(generate_fn, description, key=None, meter=None, bars=None, max_chunk
     header is rewritten to that count, and generation stops there. A Chopin prelude
     ran to 78 bars because the header, not the brief, set the length.
     """
-    first = generate_fn(make_prompt(description, key, meter))
-    header = [l for l in first.splitlines() if l.startswith(("<|meta|>", "<|plan|>"))]
     planned = bars or _brief_bars(description)
+    first = _call_generate(generate_fn, make_prompt(description, key, meter), planned)
+    header = [l for l in first.splitlines() if l.startswith(("<|meta|>", "<|plan|>"))]
     if not header:
         header = [f"<|meta|> key={key or 'C_Major'} ts={meter or '4/4'} bars={planned or 64} spb=12"]
     if planned:
@@ -52,7 +99,9 @@ def compose(generate_fn, description, key=None, meter=None, bars=None, max_chunk
                 break
             ctx.insert(0, b)
             used += measure(b)
-        out = generate_fn(make_prompt(description, key, meter, header, ctx, len(bars) + 1))
+        remaining = (total - len(bars)) if total else None
+        out = _call_generate(
+            generate_fn, make_prompt(description, key, meter, header, ctx, len(bars) + 1), remaining)
         new = _complete_bars(out)
         if not new:
             break
