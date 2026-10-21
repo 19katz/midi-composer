@@ -1,0 +1,4 @@
+Serenade
+Alexander Borodin · Petite Suite · D-flat major · 6/8
+
+The brief is Borodin's Serenade: D-flat major, 6/8, 43 bars. Seeds 0 and 1 are two draws from the step 507 checkpoint (temperature 0.9, pitch and rhythm penalties on). The original beside them is Bernd Krueger's piano-midi.de score, rendered from the MIDI so it can play next to the model's wavs.

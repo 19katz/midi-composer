@@ -1,0 +1,4 @@
+Menuet
+Claude Debussy · Suite bergamasque · A minor · 3/4 · andantino
+
+The brief is Debussy's Menuet: A minor, 3/4, 104 bars. The shelf has seed 0 from the step 507 checkpoint. The original is Bernd Krueger's piano-midi.de score, rendered from the MIDI.

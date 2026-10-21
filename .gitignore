@@ -8,4 +8,7 @@ __pycache__/
 data/
 checkpoints/
 *.wav
+!web/pieces/**/*.wav
 midicomposer_lib/
+web/node_modules/
+web/dist/
