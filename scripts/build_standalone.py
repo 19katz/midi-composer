@@ -21,7 +21,7 @@ INTRO = """**Standalone version.** Upload this file to Colab (File > Upload note
 
 """
 
-SETUP = f"""import glob, json, os, sys
+SETUP = f"""# Colab entry point: mount Drive when it is available, install the audio and\n# data libraries, and put the library written below on the import path.\nimport glob, json, os, sys
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 IN_COLAB = 'google.colab' in sys.modules
@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.abspath('{LIB}'))"""
 
 LIB_INTRO = """## Library code
 
-The `midicomposer` package, written to `midicomposer_lib/` so the cells below can import it. Run these cells; don't edit them here (they are regenerated from the repo's `src/midicomposer/`)."""
+The `midicomposer` package, written to `midicomposer_lib/` so the cells below can import it. Run these cells once per runtime; don't edit them here (they are regenerated from the repo's `src/midicomposer/`). A disconnect deletes this copy, so rerun this section before any cell that imports `midicomposer`."""
 
 
 def build():
@@ -60,7 +60,11 @@ def build():
         with open(os.path.join(PKG, f"{name}.py")) as fh:
             src = fh.read().rstrip("\n")
         lib.append(nbformat.v4.new_code_cell(f"%%writefile {LIB}/midicomposer/{name}.py\n{src}\n"))
-    lib.append(nbformat.v4.new_code_cell("import importlib\nimportlib.invalidate_caches()"))
+    lib.append(nbformat.v4.new_code_cell(
+        "# Drop stale bytecode so the cells below import the files just written.\n"
+        "import importlib\n"
+        "importlib.invalidate_caches()"
+    ))
 
     out = nbformat.v4.new_notebook(metadata=nb.metadata)
     out.cells = [intro, nbformat.v4.new_code_cell(SETUP), *lib, *cells[2:]]
