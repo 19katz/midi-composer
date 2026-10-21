@@ -6,6 +6,8 @@ meter, the length, and a description of the music.
 
 You can hear the results in the [listening room](web/). Training and generation run in the
 [Colab notebook](https://colab.research.google.com/github/19katz/midi-composer/blob/main/notebooks/midi_composer_colab.ipynb).
+You can listen to the full generation results on the test set, as well as the
+custom-created piece, [here](https://drive.google.com/drive/folders/1OzHyS5fATVBeuYv3xYN7F4Gn8destLQm).
 
 ## About this project
 
@@ -58,7 +60,7 @@ What you hear is that generation, seed 0 from the step 507 checkpoint. GitHub st
 the player muted, so turn the sound on. The same recording is on the shelf in the
 listening room, and the file is [sample/nocturne.mp4](sample/nocturne.mp4).
 
-<video src="sample/nocturne.mp4" controls playsinline></video>
+https://github.com/user-attachments/assets/f033f33a-a677-4f24-ae45-f35d1a35ccad
 
 ## Approach
 
