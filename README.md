@@ -60,7 +60,7 @@ What you hear is that generation, seed 0 from the step 507 checkpoint. GitHub st
 the player muted, so turn the sound on. The same recording is on the shelf in the
 listening room, and the file is [sample/nocturne.mp4](sample/nocturne.mp4).
 
-https://github.com/user-attachments/assets/f033f33a-a677-4f24-ae45-f35d1a35ccad
+https://github.com/user-attachments/assets/6664e0fb-2dcb-499b-b6be-66a6c168783c
 
 ## Approach
 
