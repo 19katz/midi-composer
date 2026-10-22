@@ -1,4 +1,4 @@
 Prelude No. 21
 Frédéric Chopin · Op. 28 · B-flat major · 3/4 · cantabile
 
-The brief is Chopin's Prelude in B-flat major: 3/4, 59 bars. Seeds 0 and 1 are two generations of that brief from the step 507 checkpoint. The original is Bernd Krueger's piano-midi.de score, rendered from the MIDI.
+The brief is Chopin's Prelude in B-flat major: 3/4, 59 bars. Seeds 0 and 1 are two generations of that brief. The original is Bernd Krueger's piano-midi.de score, rendered from the MIDI.

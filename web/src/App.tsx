@@ -45,9 +45,8 @@ export function App() {
         <h1>MIDI Composer</h1>
         <p>
           A small language model, fine-tuned with LoRA on 332 classical solo-piano scores, writes a
-          new piece from a short brief. This room plays the wavs from checkpoint step 507: the
-          held-out generations, two seeds of the same brief where the run kept both, the original
-          score beside those, and a nocturne written from a new brief.
+          new piece from a short brief. This room plays the .wavs from a fine-tuned model
+          checkpoint trained on 90% of the data.
         </p>
         <p className="quiet">
           Originals are Bernd Krueger’s piano-midi.de scores (CC BY-SA), rendered with the
@@ -130,7 +129,7 @@ function NowPlaying({ track, index, total }: { track: Track; index: number; tota
       {work.takes.length > 1 && (
         <Compare
           heading="Two generations"
-          note="Same brief, two seeds from the step 507 checkpoint."
+          note="Same brief, two seeds."
           lanes={work.takes}
           openId={take.id}
         />
