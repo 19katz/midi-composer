@@ -102,6 +102,8 @@ MIDI for each original lives outside the repo, in `~/Downloads/MIDI`. I rendered
 MIDI files with FluidR3, the same piano the run uses, at 22050 Hz, so an original and a
 generation can sit in one player.
 
+![The listening room, open on Borodin's Serenade](web/listening_room.png)
+
 The shelf is the same recordings looked at three ways:
 
 - **Track list.** Every generation from the step 507 run: Borodin's Serenade (seeds 0
